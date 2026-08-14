@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+.AppleDouble
+
+# Xcode / Swift
+.build/
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+.swiftpm/
+
+# Node.js / relay runtime
+node_modules/
+.dsh-relay/
+deepseek-harness-sync-server/.dsh-relay/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Local secrets and TLS material
+.env
+.env.*
+!.env.example
+.secrets/
+*.pem
+*.key
+*.p12
+
+# The official Harness checkout is an external runtime dependency.
+deepseek-harness-master/
+
+# Local working notes / generated patches
+PR-session-prompt-slash-dispatch.md
+lefthook.yml

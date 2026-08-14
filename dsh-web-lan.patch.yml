@@ -1,0 +1,8 @@
+# 仅由 start-dsh-web-lan.command 使用的临时开放 patch。
+# 作用：覆盖 web profile 里的 webserver 行，把监听地址从 127.0.0.1 改成 0.0.0.0。
+# 官方命令行 --host 0.0.0.0 被刻意禁用；此 overlay 是给可信本地网络测试用的逃生门。
+# 测试完成后运行 stop-dsh-web.command，再运行 start-dsh-web.command 恢复普通模式。
+- id: webserver
+  config:
+    host: 0.0.0.0
+    port: 3080

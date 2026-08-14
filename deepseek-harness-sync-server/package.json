@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-harness-sync-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-knowledge sync and encrypted relay for DeepSeek Harness clients",
+  "scripts": {
+    "start": "node src/cli.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
