@@ -602,10 +602,13 @@ final class HarnessAPI {
         }
     }
 
-    func prompt(sessionId: String, text: String, images: [DraftImage] = [], mode: String = "queue", completion: @escaping (Result<Void, Error>) -> Void) {
+    func prompt(sessionId: String, text: String, images: [DraftImage] = [], files: [DraftTextFile] = [], mode: String = "queue", completion: @escaping (Result<Void, Error>) -> Void) {
         var content: [[String: Any]] = images.map { image in
             ["type": "image", "mediaType": image.mediaType, "data": image.data.base64EncodedString(), "name": image.name]
         }
+        content.append(contentsOf: files.compactMap { file in
+            file.promptText.map { ["type": "text", "text": $0] }
+        })
         if !text.isEmpty { content.append(["type": "text", "text": text]) }
         let payload: [String: Any] = [
             "sessionId": sessionId,
@@ -616,8 +619,9 @@ final class HarnessAPI {
         call("session.prompt", payload: payload) { result in completion(result.map { _ in () }) }
     }
 
-    func subagentPrompt(parentSessionId: String, childSessionId: String, mode: String, text: String, images: [DraftImage] = [], completion: @escaping (Result<String, Error>) -> Void) {
+    func subagentPrompt(parentSessionId: String, childSessionId: String, mode: String, text: String, images: [DraftImage] = [], files: [DraftTextFile] = [], completion: @escaping (Result<String, Error>) -> Void) {
         var content: [[String: Any]] = images.map { image in ["type": "image", "mediaType": image.mediaType, "data": image.data.base64EncodedString(), "name": image.name] }
+        content.append(contentsOf: files.compactMap { file in file.promptText.map { ["type": "text", "text": $0] } })
         if !text.isEmpty { content.append(["type": "text", "text": text]) }
         let payload: [String: Any] = ["parentSessionId": parentSessionId, "childSessionId": childSessionId, "mode": mode, "content": content, "clientTimeZone": TimeZone.current.identifier]
         call("subagent.prompt", payload: payload) { result in completion(result.flatMap { value in

@@ -639,6 +639,21 @@ struct DraftImageCandidate {
     let mediaType: String
 }
 
+struct DraftTextFile: Identifiable, Hashable {
+    let id: UUID
+    let url: URL
+    let mediaType: String
+    let data: Data
+    var name: String { url.lastPathComponent }
+    var byteCountText: String { ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file) }
+
+    var promptText: String? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let escapedName = name.replacingOccurrences(of: "\"", with: "&quot;")
+        return "<attached_file name=\"\(escapedName)\" media_type=\"\(mediaType)\">\n\(text)\n</attached_file>"
+    }
+}
+
 struct ConversationItem: Hashable, Identifiable {
     let id: String
     let kind: ConversationKind

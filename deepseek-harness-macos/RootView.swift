@@ -234,16 +234,25 @@ struct RootView: View {
         let group = DispatchGroup()
         let lock = NSLock()
         var candidates: [Int: DraftImageCandidate] = [:]
+        var textFiles: [Int: URL] = [:]
         var invalid = false
         for (index, provider) in providers.enumerated() {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 group.enter()
                 _ = provider.loadObject(ofClass: URL.self) { url, _ in
                     defer { group.leave() }
-                    guard let url, let mediaType = Self.imageMediaType(url), let data = try? Data(contentsOf: url) else {
+                    guard let url, let data = try? Data(contentsOf: url) else {
                         lock.lock(); invalid = true; lock.unlock(); return
                     }
-                    lock.lock(); candidates[index] = DraftImageCandidate(data: data, name: url.lastPathComponent, mediaType: mediaType); lock.unlock()
+                    lock.lock()
+                    if let mediaType = Self.imageMediaType(url) {
+                        candidates[index] = DraftImageCandidate(data: data, name: url.lastPathComponent, mediaType: mediaType)
+                    } else if data.count <= 1_024 * 1_024, String(data: data, encoding: .utf8) != nil {
+                        textFiles[index] = url
+                    } else {
+                        invalid = true
+                    }
+                    lock.unlock()
                 }
             } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                 group.enter()
@@ -258,9 +267,11 @@ struct RootView: View {
             lock.lock()
             let failed = invalid
             let ordered = candidates.keys.sorted().compactMap { candidates[$0] }
+            let orderedFiles = textFiles.keys.sorted().compactMap { textFiles[$0] }
             lock.unlock()
-            if failed { model.errorText = "仅支持 PNG、JPG、WebP、GIF 格式的图片" }
-            else { model.addImages(ordered) }
+            if failed { model.errorText = "仅支持图片和不超过 1 MB 的 UTF-8 文本/代码文件" }
+            model.addImages(ordered)
+            orderedFiles.forEach(model.addTextFile)
         }
         return true
     }
@@ -1750,7 +1761,7 @@ private struct CommandEventRow: View {
                                 .rotationEffect(.degrees(expanded ? 180 : 0))
                         } else { DeepSeekIcon(kind: .terminal, size: 14) }
                     }.frame(width: 14, height: 20)
-                    Text(name).font(.system(size: 14)).foregroundStyle(error ? Color.red : Color.secondary)
+                    Text("/\(name)").font(.system(size: 14, design: .monospaced)).foregroundStyle(error ? Color.red : Color.secondary)
                     Text("·").foregroundStyle(.quaternary)
                     Text(summary.replacingOccurrences(of: "\n", with: " "))
                         .font(.system(size: 14)).foregroundStyle(error ? Color.red : Color(nsColor: .tertiaryLabelColor))
@@ -2141,6 +2152,7 @@ private struct UploadIllustration: View {
 private struct AttachmentRailNative: View {
     @EnvironmentObject private var model: AppModel
     let images: [DraftImage]
+    let files: [DraftTextFile]
     let openImage: (ImageLightboxItem) -> Void
     @FocusState private var focusedImageID: UUID?
     var body: some View {
@@ -2161,6 +2173,20 @@ private struct AttachmentRailNative: View {
                             Button { model.removeImage(image) } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.white, .black.opacity(0.55)) }
                                 .buttonStyle(.plain).padding(4)
                         }.id(image.id).frame(width: 64, height: 64).background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+                }
+                ForEach(files) { file in
+                    ZStack(alignment: .topTrailing) {
+                        VStack(spacing: 4) {
+                            Image(systemName: "doc.text").font(.system(size: 20)).foregroundStyle(.secondary)
+                            Text(file.name).font(.system(size: 10)).lineLimit(1).truncationMode(.middle)
+                            Text(file.byteCountText).font(.system(size: 9)).foregroundStyle(.tertiary)
+                        }
+                        .padding(6).frame(width: 76, height: 64)
+                        .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+                        Button { model.removeFile(file) } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.white, .black.opacity(0.55))
+                        }.buttonStyle(.plain).padding(4)
+                    }.id(file.id)
                 }
                 }.padding(.horizontal, 2)
             }.frame(height: 64)
@@ -2708,8 +2734,8 @@ private struct ComposerViewSwiftUI: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            if !model.draftImages.isEmpty {
-                AttachmentRailNative(images: model.draftImages, openImage: openImage)
+            if !model.draftImages.isEmpty || !model.draftFiles.isEmpty {
+                AttachmentRailNative(images: model.draftImages, files: model.draftFiles, openImage: openImage)
                     .padding(.horizontal, 12).padding(.top, 4)
             }
             ComposerTextInput(text: $draft, height: $editorHeight, focused: $focused, onSubmit: submit)
@@ -2850,12 +2876,12 @@ private struct ComposerViewSwiftUI: View {
     }
 
     private var canSubmit: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.draftImages.isEmpty
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.draftImages.isEmpty || !model.draftFiles.isEmpty
     }
 
     private func submit() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !model.draftImages.isEmpty else { return }
+        guard !text.isEmpty || !model.draftImages.isEmpty || !model.draftFiles.isEmpty else { return }
         draft = ""
         let running = model.current?.running == true
         let modifiers = NSEvent.modifierFlags
@@ -3204,6 +3230,13 @@ private struct SlashCommandMenu: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button(action: chooseImages) { Label("图片", systemImage: "photo") }
+                Button(action: chooseFiles) { Label("文件", systemImage: "doc.text") }
+                Spacer(minLength: 0)
+            }
+            .buttonStyle(.borderless).padding(.horizontal, 10).frame(height: 38)
+            Divider()
             TextField("搜索命令", text: $query).textFieldStyle(.plain).padding(.horizontal, 12).frame(height: 38)
             Divider()
             ScrollView {
@@ -3233,6 +3266,26 @@ private struct SlashCommandMenu: View {
     }
     private func choose(_ command: CommandDescriptor) {
         draft = "/\(command.name)\(command.inputHint == nil ? "" : " ")"
+        presented = false
+    }
+
+    private func chooseImages() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png, .jpeg, .gif, .webP]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.prompt = "添加图片"
+        if panel.runModal() == .OK { panel.urls.forEach(model.addImage) }
+        presented = false
+    }
+
+    private func chooseFiles() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .sourceCode, .json, .xml, .commaSeparatedText, .text]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.prompt = "添加文件"
+        if panel.runModal() == .OK { panel.urls.forEach(model.addTextFile) }
         presented = false
     }
 }
@@ -3984,10 +4037,24 @@ private struct AgentPresetSettingsView: View {
                     Text("WebUI 通过打开预设目录写入文件；这里提供原生编辑草稿，点击“打开目录”后保存到实际文件即可。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                TextEditor(text: Binding(get: { draft.isEmpty ? (model.agentPresetContent ?? "正在读取…") : draft }, set: { draft = $0 }))
-                    .font(.system(size: 12, design: .monospaced))
-                    .disabled(preset.trust == "system")
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2)))
+                Group {
+                    if preset.trust == "system" {
+                        ScrollView([.horizontal, .vertical]) {
+                            Text(model.agentPresetContent ?? "正在读取…")
+                                .font(.system(size: 12, design: .monospaced))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: true, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                                .padding(10)
+                        }
+                    } else {
+                        TextEditor(text: $draft)
+                            .font(.system(size: 12, design: .monospaced))
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .textBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2)))
                 HStack {
                     Button("打开目录") { model.openPreset(preset) }
                     if preset.trust == "user" {

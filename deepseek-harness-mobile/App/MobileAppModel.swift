@@ -21,9 +21,43 @@ final class MobileAppModel: ObservableObject {
     @Published var planSelectionBusy = false
     @Published var workspaceSelectionBusy = false
     @Published var showingNewSession = false
+    @Published var subagents: [String: [MobileSubagentEntry]] = [:]
+    @Published var subagentStack: [MobileSubagentNavigation] = []
+    @Published var subagentParentAvailable: [String: Bool] = [:]
+    @Published var jobs: [String: [MobileBackgroundJob]] = [:]
+    @Published var queues: [String: [MobileQueuedMessage]] = [:]
+    @Published var approvals: [MobileApprovalRequest] = []
+    @Published var draftAttachments: [MobileDraftAttachment] = []
+    @Published var reconnecting = false
+    @Published var interactionBusy = false
     let profiles = ServerProfileStore()
+    private let eventStream = MobileEventStream()
+    private var liveRefreshTask: Task<Void, Never>?
+    private var relayRefreshTask: Task<Void, Never>?
 
     var selectedSession: MobileSession? { sessions.first { $0.id == selectedSessionID } }
+    var activeConversationID: String? { subagentStack.last?.entry.id ?? selectedSessionID }
+    var conversationTitle: String { subagentStack.last?.entry.displayName ?? selectedSession?.title ?? "DeepSeek Harness" }
+    var currentJobs: [MobileBackgroundJob] {
+        guard let id = activeConversationID else { return [] }
+        return (jobs[id] ?? []).sorted {
+            if $0.isLive != $1.isLive { return $0.isLive }
+            if $0.isLive { return $0.startedAt < $1.startedAt }
+            return ($0.finishedAt ?? $0.startedAt) > ($1.finishedAt ?? $1.startedAt)
+        }
+    }
+    var currentQueue: [MobileQueuedMessage] {
+        guard let id = activeConversationID else { return [] }
+        return (queues[id] ?? []).filter { $0.placement == "queued" }
+    }
+    var currentApproval: MobileApprovalRequest? {
+        guard let id = activeConversationID else { return nil }
+        return approvals.first { $0.sessionID == id }
+    }
+    var isConversationRunning: Bool {
+        if let child = subagentStack.last { return child.entry.activity == "running" }
+        return selectedSession?.running == true
+    }
     var currentWorkspace: MobileWorkspace? {
         guard let selectedSession else { return workspaces.first }
         if let owner = workspaces.first(where: { $0.sessionIDs.contains(selectedSession.id) }) { return owner }
@@ -33,15 +67,29 @@ final class MobileAppModel: ObservableObject {
         return nil
     }
 
-    func start() async { await refresh() }
+    func start() async {
+        configureLiveUpdates()
+        await refresh()
+    }
+
+    func setSceneActive(_ active: Bool) {
+        if active { configureLiveUpdates() }
+        else {
+            eventStream.disconnect()
+            relayRefreshTask?.cancel()
+            relayRefreshTask = nil
+        }
+    }
 
     func select(_ session: MobileSession) async {
+        subagentStack = []
         selectedSessionID = session.id
         await loadHistory(session.id)
         await loadModels(session.id)
+        await loadSubagents(parentID: session.id)
     }
 
-    func refresh() async {
+    func refresh(reportErrors: Bool = true) async {
         loading = true
         defer { loading = false }
         do {
@@ -54,15 +102,23 @@ final class MobileAppModel: ObservableObject {
                               ?? []).compactMap(MobileWorkspace.init)
             }
             status = "已连接 · \(profiles.selected.name)"
+            reconnecting = false
             if selectedSessionID == nil, let first = sessions.first { await select(first) }
             else if let selectedSessionID {
-                await loadHistory(selectedSessionID)
+                if let child = subagentStack.last {
+                    await loadSubagentHistory(parentID: child.parentID, entry: child.entry)
+                } else {
+                    await loadHistory(selectedSessionID)
+                }
                 await loadModels(selectedSessionID)
             }
-        } catch { show(error) }
+        } catch {
+            if reportErrors { show(error) }
+            else { status = "正在重新连接…"; reconnecting = true }
+        }
     }
 
-    func createSession(workspaceID: String? = nil) async {
+    func createSession(workspaceID: String? = nil, ungrouped: Bool = false) async {
         guard !workspaceSelectionBusy else { return }
         workspaceSelectionBusy = true
         defer { workspaceSelectionBusy = false }
@@ -78,6 +134,8 @@ final class MobileAppModel: ObservableObject {
                     return
                 }
                 payload["workspaceId"] = workspaceID
+            } else if ungrouped {
+                if let cwd = selectedSession?.cwd ?? sessions.first?.cwd { payload["cwd"] = cwd }
             } else if let selectedSessionID,
                let workspace = workspaces.first(where: { $0.sessionIDs.contains(selectedSessionID) }) {
                 payload["workspaceId"] = workspace.id
@@ -142,19 +200,42 @@ final class MobileAppModel: ObservableObject {
 
     func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let sessionID = selectedSessionID else { return }
+        guard (!text.isEmpty || !draftAttachments.isEmpty), let sessionID = selectedSessionID else { return }
+        let attachments = draftAttachments
         draft = ""
         sending = true
-        messages.append(MobileMessage(id: "local-\(UUID())", role: .user, text: text, time: Date()))
+        if !text.isEmpty { messages.append(MobileMessage(id: "local-\(UUID())", role: .user, text: text, time: Date())) }
         defer { sending = false }
         do {
-            let payload: [String: Any] = ["sessionId": sessionID, "mode": "queue",
-                                          "content": [["type": "text", "text": text]],
-                                          "clientTimeZone": TimeZone.current.identifier]
-            _ = try await transport().call("session.prompt", payload: payload)
+            var content = attachments.compactMap { $0.promptBlock() }
+            if !text.isEmpty { content.append(["type": "text", "text": text]) }
+            let payload: [String: Any]
+            let method: String
+            if let child = subagentStack.last {
+                guard child.entry.mode == "continuable",
+                      subagentParentAvailable[child.parentID] == true else {
+                    throw TransportError.remote("这个子代理记录当前只读")
+                }
+                method = "subagent.prompt"
+                payload = ["parentSessionId": child.parentID, "childSessionId": child.entry.id,
+                           "mode": child.entry.mode, "content": content,
+                           "clientTimeZone": TimeZone.current.identifier]
+            } else {
+                method = "session.prompt"
+                payload = ["sessionId": sessionID, "mode": "queue", "content": content,
+                           "clientTimeZone": TimeZone.current.identifier]
+            }
+            _ = try await transport().call(method, payload: payload)
+            let sentIDs = Set(attachments.map(\.id))
+            draftAttachments.removeAll { sentIDs.contains($0.id) }
+            if let child = subagentStack.last {
+                await loadSubagentHistory(parentID: child.parentID, entry: child.entry, reportErrors: false)
+                await loadSubagents(parentID: child.parentID)
+                return
+            }
             var observedRunning = false
             for tick in 0..<1_200 {
-                let history = await loadHistory(sessionID, reportErrors: false, matchingPrompt: text)
+                let history = await loadHistory(activeConversationID ?? sessionID, reportErrors: false, matchingPrompt: text)
                 if history.hasOpenTurn { observedRunning = true }
                 if tick.isMultiple(of: 2), let running = await refreshSessionRunning(sessionID) {
                     observedRunning = observedRunning || running
@@ -171,12 +252,120 @@ final class MobileAppModel: ObservableObject {
     }
 
     func reconnect() async {
+        eventStream.disconnect()
+        relayRefreshTask?.cancel()
         selectedSessionID = nil
+        subagentStack = []
         messages = []
         models = []
         currentModel = nil
         status = "正在连接…"
+        configureLiveUpdates()
         await refresh()
+    }
+
+    func loadSubagents(parentID: String) async {
+        do {
+            let result = try await transport().call("subagent.list", payload: ["parentSessionId": parentID])
+            subagents[parentID] = (result["entries"] as? [[String: Any]] ?? []).compactMap(MobileSubagentEntry.init)
+            subagentParentAvailable[parentID] = result["parentAvailable"] as? Bool ?? false
+        } catch {
+            // Subagents are optional on older Hosts; keep the rest of the conversation usable.
+        }
+    }
+
+    func openSubagent(_ entry: MobileSubagentEntry, parentID: String) async {
+        guard !entry.isDiagnostic else { return }
+        subagentStack.append(MobileSubagentNavigation(parentID: parentID, entry: entry))
+        await loadSubagentHistory(parentID: parentID, entry: entry)
+        await loadSubagents(parentID: entry.id)
+    }
+
+    func leaveSubagent() async {
+        guard !subagentStack.isEmpty else { return }
+        subagentStack.removeLast()
+        if let parent = subagentStack.last {
+            await loadSubagentHistory(parentID: parent.parentID, entry: parent.entry)
+        } else if let selectedSessionID {
+            await loadHistory(selectedSessionID)
+        }
+    }
+
+    func interruptSubagent(_ entry: MobileSubagentEntry, parentID: String) async {
+        do {
+            _ = try await transport().call("subagent.interrupt", payload: [
+                "parentSessionId": parentID, "childSessionId": entry.id, "mode": entry.mode,
+            ])
+            await loadSubagents(parentID: parentID)
+        } catch { show(error) }
+    }
+
+    func stopCurrentConversation() async {
+        do {
+            if let child = subagentStack.last {
+                try await interruptSubagentThrowing(child.entry, parentID: child.parentID)
+                await loadSubagents(parentID: child.parentID)
+            } else if let selectedSessionID {
+                _ = try await transport().call("session.cancel", payload: ["sessionId": selectedSessionID])
+                await refresh(reportErrors: false)
+            }
+        } catch { show(error) }
+    }
+
+    func answerApproval(_ request: MobileApprovalRequest, outcome: String) async {
+        guard !interactionBusy else { return }
+        interactionBusy = true
+        defer { interactionBusy = false }
+        do {
+            try await transport().respond(rpcID: request.rpcID, result: ["ok": true, "value": [
+                "sessionId": request.sessionID,
+                "approvalId": request.approvalID,
+                "outcome": outcome,
+            ]])
+        } catch { show(error) }
+    }
+
+    func updateQueue(_ item: MobileQueuedMessage, action: [String: Any]) async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            _ = try await transport().call("session.updateQueue", payload: [
+                "sessionId": sessionID, "itemId": item.id, "action": action,
+            ])
+        } catch { show(error) }
+    }
+
+    private func interruptSubagentThrowing(_ entry: MobileSubagentEntry, parentID: String) async throws {
+        _ = try await transport().call("subagent.interrupt", payload: [
+            "parentSessionId": parentID, "childSessionId": entry.id, "mode": entry.mode,
+        ])
+    }
+
+    func addImage(data: Data, name: String, mediaType: String) {
+        guard !data.isEmpty else { return }
+        guard ["image/png", "image/jpeg", "image/webp", "image/gif"].contains(mediaType) else {
+            errorMessage = "仅支持 PNG、JPG、WebP、GIF 图片"
+            return
+        }
+        guard data.count <= 20 * 1_024 * 1_024 else { errorMessage = "单张图片不能超过 20 MB"; return }
+        draftAttachments.append(MobileDraftAttachment(id: UUID(), kind: .image, name: name,
+                                                       mediaType: mediaType, data: data))
+    }
+
+    func addTextFile(url: URL) {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { errorMessage = "无法读取文件"; return }
+        guard data.count <= 1_024 * 1_024 else { errorMessage = "文本文件不能超过 1 MB"; return }
+        guard String(data: data, encoding: .utf8) != nil else {
+            errorMessage = "当前 Host 只支持图片和 UTF-8 文本/代码文件，无法发送这个二进制文件"
+            return
+        }
+        draftAttachments.append(MobileDraftAttachment(id: UUID(), kind: .textFile,
+            name: url.lastPathComponent, mediaType: Self.textMediaType(for: url), data: data))
+    }
+
+    func removeAttachment(_ attachment: MobileDraftAttachment) {
+        draftAttachments.removeAll { $0.id == attachment.id }
     }
 
     func chooseModel(_ choice: MobileModelChoice) async {
@@ -207,6 +396,112 @@ final class MobileAppModel: ObservableObject {
         if profile.kind == .localHost { return DirectHarnessTransport(baseURL: profile.baseURL) }
         guard let credential = try KeychainStore.credential(profileID: profile.id) else { throw TransportError.notPaired }
         return RemoteRelayTransport(baseURL: profile.baseURL, credential: credential)
+    }
+
+    private func configureLiveUpdates() {
+        eventStream.disconnect()
+        relayRefreshTask?.cancel()
+        relayRefreshTask = nil
+        approvals = []
+        let profile = profiles.selected
+        if profile.kind == .localHost {
+            eventStream.onConnectionState = { [weak self] connected in
+                guard let self else { return }
+                self.reconnecting = !connected
+                self.status = connected ? "已连接 · \(self.profiles.selected.name)" : "正在重新连接…"
+                if connected { Task { await self.refresh(reportErrors: false) } }
+            }
+            eventStream.onFrame = { [weak self] frame in self?.handleMuxFrame(frame) }
+            eventStream.connect(baseURL: profile.baseURL)
+        } else {
+            // Relay transport is request/response based, so a quiet refresh
+            // loop supplies the same self-healing behaviour without alerts.
+            relayRefreshTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(2))
+                    guard let self, !Task.isCancelled else { return }
+                    await self.refresh(reportErrors: false)
+                }
+            }
+        }
+    }
+
+    private func handleMuxFrame(_ payload: [String: Any]) {
+        let type = payload["type"] as? String ?? ""
+        let sessionID = payload["sessionId"] as? String ?? ""
+        if type == "approval/requested" {
+            guard let rpcID = payload["_rpcId"] as? String,
+                  let approvalID = payload["approvalId"] as? String,
+                  let toolName = payload["toolName"] as? String else { return }
+            approvals.removeAll { $0.approvalID == approvalID }
+            approvals.append(MobileApprovalRequest(rpcID: rpcID, sessionID: sessionID,
+                approvalID: approvalID, toolName: toolName,
+                callID: payload["callId"] as? String, reason: payload["reason"] as? String))
+            return
+        }
+        if type == "approval/resolved", let approvalID = payload["approvalId"] as? String {
+            approvals.removeAll { $0.approvalID == approvalID }
+            return
+        }
+        if type == "session/jobs" {
+            jobs[sessionID] = (payload["jobs"] as? [[String: Any]] ?? []).compactMap(MobileBackgroundJob.init)
+            return
+        }
+        if type == "session/queue" {
+            queues[sessionID] = (payload["items"] as? [[String: Any]] ?? []).compactMap(MobileQueuedMessage.init)
+            return
+        }
+        if type == "session/projection" || type == "session/status" {
+            Task { [weak self] in await self?.refresh(reportErrors: false) }
+            return
+        }
+        if type == "session/event" {
+            liveRefreshTask?.cancel()
+            liveRefreshTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(120))
+                guard let self, !Task.isCancelled else { return }
+                if sessionID == self.activeConversationID {
+                    if let child = self.subagentStack.last {
+                        await self.loadSubagentHistory(parentID: child.parentID, entry: child.entry, reportErrors: false)
+                    } else if let selectedSessionID = self.selectedSessionID {
+                        await self.loadHistory(selectedSessionID, reportErrors: false)
+                    }
+                }
+                if let rootID = self.selectedSessionID { await self.loadSubagents(parentID: rootID) }
+            }
+        }
+    }
+
+    @discardableResult
+    private func loadSubagentHistory(parentID: String, entry: MobileSubagentEntry,
+                                     reportErrors: Bool = true) async -> HistoryPollState {
+        do {
+            let result = try await transport().call("subagent.history", payload: [
+                "parentSessionId": parentID, "childSessionId": entry.id,
+                "mode": entry.mode, "maxMessages": 120,
+            ])
+            let events = result["events"] as? [[String: Any]] ?? []
+            let projection = await Task.detached(priority: .userInitiated) {
+                (Self.parseMessages(events), Self.historyState(events, matchingPrompt: nil))
+            }.value
+            if subagentStack.last?.entry.id == entry.id { messages = projection.0 }
+            return projection.1
+        } catch {
+            if reportErrors { show(error) }
+            return .empty
+        }
+    }
+
+    private static func textMediaType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "json": return "application/json"
+        case "md", "markdown": return "text/markdown"
+        case "html", "htm": return "text/html"
+        case "css": return "text/css"
+        case "csv": return "text/csv"
+        case "xml": return "application/xml"
+        default: return "text/plain"
+        }
     }
 
     @discardableResult
@@ -317,6 +612,7 @@ final class MobileAppModel: ObservableObject {
             var role: MobileMessageRole
         }
         var tools: [String: ToolRecord] = [:]
+        var commands: [String: (name: String, args: String?, summary: String?, running: Bool, error: Bool)] = [:]
         var children: [String: [String]] = [:]
         var finalizedSteps = Set<String>()
         for wrapper in entries {
@@ -328,6 +624,15 @@ final class MobileAppModel: ObservableObject {
                 finalizedSteps.insert("\(turn):\(step)")
             }
             switch event["type"] as? String {
+            case "command/run":
+                guard let id = data["commandId"] as? String else { break }
+                commands[id] = (data["name"] as? String ?? "command", data["args"] as? String,
+                                nil, true, false)
+            case "command/done":
+                guard let id = data["commandId"] as? String else { break }
+                let old = commands[id] ?? ("command", nil, nil, true, false)
+                commands[id] = (old.name, old.args, data["text"] as? String,
+                                false, data["kind"] as? String == "error")
             case "tool/call":
                 guard let id = data["callId"] as? String else { break }
                 let view = (wrapper["view"] as? [String: Any])?["view"] as? [String: Any]
@@ -386,6 +691,15 @@ final class MobileAppModel: ObservableObject {
             let message = HarnessTranscriptParsing.message(from: data)
             let content = HarnessTranscriptParsing.content(data: data, message: message)
             switch type {
+            case "command/run":
+                guard let id = data["commandId"] as? String, let command = commands[id] else { break }
+                let suffix = command.args?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let line = suffix.isEmpty ? "/\(command.name)" : "/\(command.name) \(suffix)"
+                result.append(MobileMessage(id: "command-\(id)", role: .command, text: line, time: time,
+                    detail: command.summary ?? (command.running ? "正在执行" : command.error ? "执行失败" : "已完成"),
+                    isError: command.error, running: command.running))
+            case "command/done":
+                break
             case "user/message":
                 guard HarnessTranscriptParsing.isVisibleUserMessage(data: data, message: message) else { continue }
                 let text = HarnessTranscriptParsing.text(from: content)

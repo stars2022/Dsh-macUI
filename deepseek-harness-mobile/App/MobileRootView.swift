@@ -1,4 +1,6 @@
 import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
 
 struct MobileRootView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -130,20 +132,28 @@ struct MobileRootView: View {
             .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        withAnimation(.snappy(duration: 0.3)) { showingSessions = true }
-                    } label: {
-                        Image(systemName: "sidebar.left")
+                    HStack(spacing: 12) {
+                        if !model.subagentStack.isEmpty {
+                            Button { Task { await model.leaveSubagent() } } label: {
+                                Image(systemName: "chevron.left")
+                            }
+                            .accessibilityLabel("返回父会话")
+                        }
+                        Button {
+                            withAnimation(.snappy(duration: 0.3)) { showingSessions = true }
+                        } label: {
+                            Image(systemName: "sidebar.left")
+                        }
+                        .accessibilityLabel("会话列表")
                     }
-                    .accessibilityLabel("会话列表")
                 }
 
                 ToolbarItem(placement: .principal) {
                     VStack(spacing: 1) {
-                        Text(model.selectedSession?.title ?? "DeepSeek Harness")
+                        Text(model.conversationTitle)
                             .font(.headline).lineLimit(1)
                         HStack(spacing: 4) {
-                            Circle().fill(model.status.hasPrefix("已连接") ? Color.green : Color.orange)
+                            Circle().fill(model.reconnecting ? Color.orange : model.status.hasPrefix("已连接") ? Color.green : Color.orange)
                                 .frame(width: 5, height: 5)
                             Text(profiles.selected.name)
                         }
@@ -152,11 +162,15 @@ struct MobileRootView: View {
                     .frame(maxWidth: 230)
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { model.showingNewSession = true } label: {
-                        Image(systemName: "square.and.pencil")
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    MobileSubagentMenu()
+                    MobileJobsMenu()
+                    if model.subagentStack.isEmpty {
+                        Button { model.showingNewSession = true } label: {
+                            Image(systemName: "square.and.pencil")
+                        }
+                        .accessibilityLabel("新建会话")
                     }
-                    .accessibilityLabel("新建会话")
                 }
             }
         }
@@ -164,10 +178,14 @@ struct MobileRootView: View {
             // Keep the composer visually above the home indicator without using
             // safeAreaInset, which would resize and push the conversation.
             VStack(spacing: 8) {
-                MobileSessionProjectionDock()
-                MobileComposer(focused: $composerFocused,
-                               shouldScrollOnFocus: { conversationNearBottom },
-                               requestScrollToBottom: { scrollToBottomRequest &+= 1 })
+                if let approval = model.currentApproval {
+                    MobileApprovalComposer(request: approval)
+                } else {
+                    MobileSessionProjectionDock()
+                    MobileComposer(focused: $composerFocused,
+                                   shouldScrollOnFocus: { conversationNearBottom },
+                                   requestScrollToBottom: { scrollToBottomRequest &+= 1 })
+                }
             }
                 .background {
                     GeometryReader { proxy in
@@ -257,6 +275,73 @@ struct MobileRootView: View {
     }
 }
 
+private struct MobileSubagentMenu: View {
+    @EnvironmentObject private var model: MobileAppModel
+
+    private var parentID: String? { model.activeConversationID }
+    private var entries: [MobileSubagentEntry] { parentID.flatMap { model.subagents[$0] } ?? [] }
+    private var healthy: [MobileSubagentEntry] { entries.filter { !$0.isDiagnostic } }
+    private var runningCount: Int { healthy.filter { $0.activity == "running" }.count }
+
+    var body: some View {
+        if let parentID, !entries.isEmpty {
+            Menu {
+                ForEach(entries) { entry in
+                    if let diagnostic = entry.diagnostic {
+                        Section(entry.id) { Text(diagnostic) }
+                    } else {
+                        Button {
+                            Task { await model.openSubagent(entry, parentID: parentID) }
+                        } label: {
+                            Label(entry.displayName,
+                                  systemImage: entry.activity == "running" ? "circle.fill" : "circle")
+                        }
+                        if entry.mode == "continuable" && entry.activity == "running" {
+                            Button("中断 \(entry.displayName)", role: .destructive) {
+                                Task { await model.interruptSubagent(entry, parentID: parentID) }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "person.2")
+                    Text("\(healthy.count)").font(.caption2.monospacedDigit())
+                    if runningCount > 0 { Circle().fill(.green).frame(width: 6, height: 6) }
+                }
+            }
+            .accessibilityLabel("\(healthy.count) 个子代理")
+            .task(id: parentID) { await model.loadSubagents(parentID: parentID) }
+        }
+    }
+}
+
+private struct MobileJobsMenu: View {
+    @EnvironmentObject private var model: MobileAppModel
+
+    var body: some View {
+        if !model.currentJobs.isEmpty {
+            Menu {
+                ForEach(model.currentJobs) { job in
+                    Section(job.label) {
+                        Label(job.isLive ? "正在运行" : job.status,
+                              systemImage: job.isLive ? "circle.fill" : "checkmark")
+                        if let detail = job.detail, !detail.isEmpty { Text(detail) }
+                        Text(job.kind)
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "clock.arrow.circlepath")
+                    Text("\(model.currentJobs.filter { $0.isLive }.count)")
+                        .font(.caption2.monospacedDigit())
+                }
+            }
+            .accessibilityLabel("后台任务")
+        }
+    }
+}
+
 private struct MobileSessionSidebar: View {
     @EnvironmentObject private var model: MobileAppModel
     let bottomInset: CGFloat
@@ -294,11 +379,17 @@ private struct MobileSessionSidebar: View {
                                     } label: {
                                         HStack(spacing: 10) {
                                             Circle()
-                                                .fill(session.running ? Color.orange : Color.clear)
+                                                .fill(model.approvals.contains { $0.sessionID == session.id }
+                                                      ? Color.orange
+                                                      : session.running ? Color.orange : Color.clear)
                                                 .overlay(Circle().stroke(Color.secondary.opacity(0.28), lineWidth: 1))
                                                 .frame(width: 7, height: 7)
                                             Text(session.title).lineLimit(1)
                                             Spacer(minLength: 0)
+                                            if model.approvals.contains(where: { $0.sessionID == session.id }) {
+                                                Image(systemName: "checkmark.shield")
+                                                    .font(.caption).foregroundStyle(.orange)
+                                            }
                                         }
                                         .foregroundStyle(.primary)
                                         .frame(height: 34)
@@ -397,7 +488,7 @@ private struct MobileSessionSidebar: View {
             }
             let memberIDs = Set(sessions.map(\.id))
             let pathMatches = model.sessions
-                .filter { $0.cwd == workspace.path && !memberIDs.contains($0.id) && !accounted.contains($0.id) }
+                .filter { $0.blank && $0.cwd == workspace.path && !memberIDs.contains($0.id) && !accounted.contains($0.id) }
                 .sorted { $0.updatedAt > $1.updatedAt }
             pathMatches.forEach { accounted.insert($0.id) }
             sessions.append(contentsOf: pathMatches)
@@ -424,11 +515,25 @@ private struct MobileNewSessionSheet: View {
     @State private var selectedWorkspaceID: String?
     @State private var addingWorkspace = false
     @State private var workspacePath = ""
+    private let ungroupedID = "__ungrouped__"
 
     var body: some View {
         NavigationStack {
             List {
                 Section("工作区") {
+                    Button { selectedWorkspaceID = ungroupedID } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "tray").foregroundStyle(.secondary).frame(width: 24)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("无工作区").foregroundStyle(.primary)
+                                Text("会话显示在“未分组”中").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                            if selectedWorkspaceID == ungroupedID {
+                                Image(systemName: "checkmark").fontWeight(.semibold).foregroundStyle(.tint)
+                            }
+                        }.contentShape(Rectangle())
+                    }.buttonStyle(.plain)
                     ForEach(model.workspaces) { workspace in
                         Button { selectedWorkspaceID = workspace.id } label: {
                             HStack(spacing: 12) {
@@ -489,7 +594,10 @@ private struct MobileNewSessionSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("创建") {
                         guard let selectedWorkspaceID else { return }
-                        Task { await model.createSession(workspaceID: selectedWorkspaceID) }
+                        Task {
+                            await model.createSession(workspaceID: selectedWorkspaceID == ungroupedID ? nil : selectedWorkspaceID,
+                                                      ungrouped: selectedWorkspaceID == ungroupedID)
+                        }
                     }
                     .disabled(selectedWorkspaceID == nil || model.workspaceSelectionBusy)
                 }
@@ -521,7 +629,7 @@ private struct MobileNewSessionSheet: View {
 
     private func selectDefaultWorkspaceIfNeeded() {
         guard selectedWorkspaceID == nil
-                || !model.workspaces.contains(where: { $0.id == selectedWorkspaceID }) else { return }
+                || (selectedWorkspaceID != ungroupedID && !model.workspaces.contains(where: { $0.id == selectedWorkspaceID })) else { return }
         selectedWorkspaceID = model.currentWorkspace?.id ?? model.workspaces.first?.id
     }
 }
@@ -623,8 +731,7 @@ private struct MobileEmptyConversation: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 34, weight: .medium)).foregroundStyle(.tint)
+            DeepSeekIcon(kind: .fish, size: 42).foregroundStyle(.tint)
             VStack(spacing: 6) {
                 Text("探索未至之境").font(.title2.bold())
                 Text("选择现有会话，或从手机开始一次新任务。")
@@ -649,6 +756,11 @@ private struct MobileConversationView: View {
     var scrollToBottomRequest = 0
     @Binding var isNearBottom: Bool
     @State private var followsLatest = true
+    @State private var strictlyAtBottom = true
+    @State private var userScrolling = false
+    @State private var leftBottomDuringGesture = false
+    @State private var manualScrollSettling = false
+    @State private var manualScrollSettleGeneration = 0
 
     var body: some View {
         GeometryReader { viewport in
@@ -677,12 +789,46 @@ private struct MobileConversationView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .background(Color(.systemBackground))
                 .onPreferenceChange(ConversationBottomPreferenceKey.self) { bottomY in
-                    let nearBottom = bottomY <= viewport.size.height + 56
+                    let nearBottom = bottomY <= viewport.size.height + 24
+                    let atBottom = bottomY <= viewport.size.height + 6
                     isNearBottom = nearBottom
-                    if !nearBottom { followsLatest = false }
+                    strictlyAtBottom = atBottom
+                    if userScrolling {
+                        if !atBottom { leftBottomDuringGesture = true }
+                        if atBottom && leftBottomDuringGesture { followsLatest = true }
+                    } else if manualScrollSettling && atBottom {
+                        followsLatest = true
+                        manualScrollSettling = false
+                    }
                 }
+                .simultaneousGesture(DragGesture(minimumDistance: 4)
+                    .onChanged { value in
+                        guard abs(value.translation.height) > abs(value.translation.width) else { return }
+                        if !userScrolling {
+                            userScrolling = true
+                            leftBottomDuringGesture = false
+                            manualScrollSettling = false
+                        }
+                        followsLatest = false
+                        if !strictlyAtBottom { leftBottomDuringGesture = true }
+                    }
+                    .onEnded { value in
+                        guard userScrolling || abs(value.translation.height) > abs(value.translation.width) else { return }
+                        userScrolling = false
+                        followsLatest = strictlyAtBottom
+                        manualScrollSettling = !strictlyAtBottom
+                        manualScrollSettleGeneration &+= 1
+                        let generation = manualScrollSettleGeneration
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                            guard manualScrollSettleGeneration == generation else { return }
+                            // Preference changes during inertial scrolling may
+                            // restore follow only while this gesture is settling.
+                            if strictlyAtBottom { followsLatest = true }
+                            manualScrollSettling = false
+                        }
+                    })
                 .overlay(alignment: .bottom) {
-                    if !isNearBottom && !model.messages.isEmpty {
+                    if !followsLatest && !model.messages.isEmpty {
                         Button {
                             followsLatest = true
                             scheduleScrollToBottom(proxy)
@@ -695,10 +841,10 @@ private struct MobileConversationView: View {
                         .transition(.scale.combined(with: .opacity))
                     }
                 }
-                .animation(.snappy(duration: 0.2), value: isNearBottom)
+                .animation(.snappy(duration: 0.2), value: followsLatest)
                 .onAppear { scheduleScrollToBottom(proxy, animated: false) }
                 .onChange(of: streamRevision) { _, _ in
-                    if followsLatest || isNearBottom { scheduleScrollToBottom(proxy) }
+                    if followsLatest { scheduleScrollToBottom(proxy, animated: false) }
                 }
                 .onChange(of: scrollToBottomRequest) { _, _ in
                     followsLatest = true
@@ -714,8 +860,7 @@ private struct MobileConversationView: View {
     }
 
     private func scheduleScrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        Task { @MainActor in
-            await Task.yield()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
             if animated {
                 withAnimation(.easeOut(duration: 0.18)) {
                     proxy.scrollTo("conversation-bottom", anchor: .bottom)
@@ -795,8 +940,7 @@ private struct MobileCompactActivityView: View {
                 withAnimation(.easeInOut(duration: 0.14)) { expanded.toggle() }
             } label: {
                 HStack(spacing: 0) {
-                    Image(systemName: activityIcon)
-                        .font(.system(size: 13, weight: .medium))
+                    DeepSeekIcon(kind: activityIcon, size: 14)
                         .frame(width: 16, height: 16)
                         .padding(.trailing, 6)
                     Text(summary).lineLimit(1)
@@ -883,24 +1027,25 @@ private struct MobileCompactActivityView: View {
         return value
     }
 
-    private var activityIcon: String {
+    private var activityIcon: DeepSeekIconKind {
         if messages.contains(where: { $0.role == .reasoning && $0.running })
-            || sourceTools.contains(where: { isCode($0) && $0.running }) { return "sparkles" }
+            || sourceTools.contains(where: { isCode($0) && $0.running }) { return .think }
         if let active = tools.last(where: { $0.running }) { return icon(for: active) }
-        return tools.last.map(icon(for:)) ?? "sparkles"
+        return tools.last.map(icon(for:)) ?? .think
     }
 
-    private func icon(for tool: MobileMessage) -> String {
+    private func icon(for tool: MobileMessage) -> DeepSeekIconKind {
         let name = (tool.toolName ?? "").lowercased()
-        if name == "todo_write" { return "checklist" }
-        if name == "ask_user_question" { return "questionmark.bubble" }
-        if name == "skill" { return "book.pages" }
-        if name.contains("search") || name == "grep" || name == "glob" { return "magnifyingglass" }
-        if name.contains("read") || name.contains("fetch") { return "doc.text" }
-        if name.contains("bash") || name.contains("shell") || name.contains("terminal") || name == "pwsh" { return "terminal" }
-        if name.contains("edit") || name.contains("write") || name.contains("patch") { return "pencil" }
-        if name.contains("code") || name.hasPrefix("cordis_") { return "chevron.left.forwardslash.chevron.right" }
-        return "sparkles"
+        if name == "todo_write" { return .checklist }
+        if name == "ask_user_question" { return .question }
+        if name == "skill" { return .skill }
+        if name.contains("search") || name == "grep" || name == "glob" { return .search }
+        if name.contains("read") || name.contains("fetch") { return .read }
+        if name.contains("bash") || name.contains("shell") || name.contains("terminal") || name == "pwsh" { return .terminal }
+        if name.contains("edit") || name.contains("write") || name.contains("patch") { return .edit }
+        if name.hasPrefix("cordis_") { return .cordis }
+        if name.contains("code") { return .code }
+        return .sparkle
     }
 }
 
@@ -915,8 +1060,99 @@ private struct MobileSessionProjectionDock: View {
                     MobileGoalDock(goal: goal)
                 }
             }
+            MobileQueueDock(queue: model.currentQueue)
         }
+        .padding(hasContent ? 8 : 0)
+        .mobileGlassSurface(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .padding(.horizontal, 12)
+    }
+
+    private var hasContent: Bool {
+        guard let session = model.selectedSession else { return !model.currentQueue.isEmpty }
+        return !session.todos.isEmpty || session.goal.map { $0.phase != "complete" } == true
+            || !model.currentQueue.isEmpty
+    }
+}
+
+private struct MobileApprovalComposer: View {
+    @EnvironmentObject private var model: MobileAppModel
+    let request: MobileApprovalRequest
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Circle().fill(.orange).frame(width: 8, height: 8)
+                Text("等待审核").fontWeight(.medium)
+                Spacer()
+                Text(request.toolName).font(.caption.monospaced()).foregroundStyle(.secondary)
+            }
+            .font(.subheadline).foregroundStyle(.orange)
+            .padding(.horizontal, 16).frame(height: 38)
+            .background(Color.orange.opacity(0.12))
+
+            Text(request.reason ?? "工具 \(request.toolName) 请求越权执行")
+                .font(.callout.weight(.medium))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16).padding(.vertical, 13)
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("拒绝", role: .destructive) {
+                    Task { await model.answerApproval(request, outcome: "rejected") }
+                }
+                .buttonStyle(.bordered)
+                Button("允许一次") {
+                    Task { await model.answerApproval(request, outcome: "allowed-once") }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .disabled(model.interactionBusy)
+            .padding(.horizontal, 16).padding(.bottom, 14)
+        }
+        .mobileGlassSurface(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .stroke(Color.orange.opacity(0.42), lineWidth: 1))
+        .padding(.horizontal, 12)
+    }
+}
+
+private struct MobileQueueDock: View {
+    @EnvironmentObject private var model: MobileAppModel
+    let queue: [MobileQueuedMessage]
+    @State private var expanded = false
+
+    var body: some View {
+        if !queue.isEmpty {
+            VStack(spacing: 0) {
+                Button { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "tray.full")
+                        Text(queue.count == 1 ? "已排队 1 条" : "已排队 \(queue.count) 条").fontWeight(.medium)
+                        Spacer()
+                        Image(systemName: "chevron.down").rotationEffect(.degrees(expanded ? 180 : 0))
+                    }.frame(height: 34).contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                if expanded || queue.count == 1 {
+                    ForEach(queue) { item in
+                        HStack(spacing: 8) {
+                            Text(item.preview).foregroundStyle(.secondary).lineLimit(2)
+                            Spacer(minLength: 4)
+                            Button { Task { await model.updateQueue(item, action: ["kind": "remove"]) } } label: {
+                                Image(systemName: "trash").frame(width: 28, height: 28)
+                            }.buttonStyle(.plain)
+                            if model.isConversationRunning {
+                                Button { Task { await model.updateQueue(item, action: ["kind": "steer"]) } } label: {
+                                    Image(systemName: "paperplane").frame(width: 28, height: 28)
+                                }.buttonStyle(.plain)
+                            }
+                        }.frame(minHeight: 36)
+                    }
+                }
+            }
+            .font(.system(size: 13)).padding(.horizontal, 12).padding(.vertical, 4)
+            .background(Color.secondary.opacity(0.075), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(0.12)))
+        }
     }
 }
 
@@ -1051,9 +1287,14 @@ private struct MobileComposer: View {
     @FocusState.Binding var focused: Bool
     let shouldScrollOnFocus: () -> Bool
     let requestScrollToBottom: () -> Void
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var importingFile = false
 
     var body: some View {
         VStack(spacing: showsControls ? 6 : 0) {
+            if !model.draftAttachments.isEmpty {
+                MobileAttachmentRail(attachments: model.draftAttachments)
+            }
             HStack(spacing: 12) {
                 if !showsControls {
                     plusMenu
@@ -1071,8 +1312,10 @@ private struct MobileComposer: View {
 
             if showsControls {
                 HStack(spacing: 12) {
-                    plusMenu
-                    permissionMenu
+                    HStack(spacing: 18) {
+                        plusMenu
+                        permissionMenu
+                    }
                     if planModeActive { planModeButton }
                     Spacer(minLength: 8)
                     modelMenu
@@ -1086,6 +1329,25 @@ private struct MobileComposer: View {
         .shadow(color: .black.opacity(0.10), radius: 18, y: 5)
         .padding(.horizontal, 12)
         .animation(.snappy(duration: 0.22), value: showsControls)
+        .fileImporter(isPresented: $importingFile, allowedContentTypes: [.plainText, .sourceCode, .json, .xml, .commaSeparatedText, .text], allowsMultipleSelection: true) { result in
+            switch result {
+            case let .success(urls): urls.forEach(model.addTextFile)
+            case let .failure(error): model.errorMessage = error.localizedDescription
+            }
+        }
+        .onChange(of: selectedPhotoItems) { _, items in
+            guard !items.isEmpty else { return }
+            Task {
+                for item in items {
+                    guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+                    let type = item.supportedContentTypes.first(where: { $0.conforms(to: .image) })
+                    let mediaType = type?.preferredMIMEType ?? "image/jpeg"
+                    let ext = type?.preferredFilenameExtension ?? "jpg"
+                    model.addImage(data: data, name: "图片-\(UUID().uuidString.prefix(8)).\(ext)", mediaType: mediaType)
+                }
+                selectedPhotoItems = []
+            }
+        }
         .onChange(of: focused) { _, isFocused in
             guard isFocused, shouldScrollOnFocus() else { return }
             Task { @MainActor in
@@ -1112,6 +1374,13 @@ private struct MobileComposer: View {
 
     private var plusMenu: some View {
         Menu {
+            PhotosPicker(selection: $selectedPhotoItems, maxSelectionCount: 8, matching: .images) {
+                Label("添加图片", systemImage: "photo")
+            }
+            Button { importingFile = true } label: {
+                Label("添加文本或代码文件", systemImage: "doc")
+            }
+            Divider()
             Button { Task { await model.refresh() } } label: {
                 Label("刷新会话", systemImage: "arrow.clockwise")
             }
@@ -1124,8 +1393,7 @@ private struct MobileComposer: View {
             }
             .disabled(model.selectedSessionID == nil || model.planSelectionBusy)
         } label: {
-            Label("更多", systemImage: "plus")
-                .labelStyle(.iconOnly)
+            DeepSeekIcon(kind: .plus, size: 17).frame(width: 34, height: 34).contentShape(Rectangle())
         }
         .foregroundStyle(.primary)
         .buttonStyle(.borderless)
@@ -1149,12 +1417,12 @@ private struct MobileComposer: View {
 
     private var permissionMenu: some View {
         Menu {
-            permissionButton("read-only", "只读", icon: "lock")
-            permissionButton("workspace-write", "工作区可写", icon: "pencil.and.outline")
-            permissionButton("danger-full-access", "完全访问", icon: "lock.open")
+            permissionButton("read-only", "只读")
+            permissionButton("workspace-write", "工作区可写")
+            permissionButton("danger-full-access", "完全访问")
         } label: {
-            Label("权限 · \(permissionLabel)", systemImage: permissionIcon)
-                .labelStyle(.iconOnly)
+            PermissionGlyph(value: model.selectedSession?.permission ?? "workspace-write", size: 18)
+                .frame(width: 36, height: 34).contentShape(Rectangle())
         }
         .foregroundStyle(.primary)
         .buttonStyle(.borderless)
@@ -1167,19 +1435,23 @@ private struct MobileComposer: View {
             focused = false
             requestScrollToBottom()
             Task {
-                await model.send()
+                if model.isConversationRunning { await model.stopCurrentConversation() }
+                else { await model.send() }
                 requestScrollToBottom()
             }
         } label: {
             Group {
                 if model.sending { ProgressView() }
-                else { Image(systemName: "arrow.up") }
+                else if model.isConversationRunning {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.white).frame(width: 10, height: 10)
+                }
+                else { DeepSeekIcon(kind: .send, size: 16) }
             }
         }
         .buttonStyle(.borderedProminent)
         .buttonBorderShape(.circle)
-        .disabled(!canSend)
-        .accessibilityLabel("发送")
+        .disabled(!model.isConversationRunning && !canSend)
+        .accessibilityLabel(model.isConversationRunning ? "中断" : "发送")
     }
 
     private var modelMenu: some View {
@@ -1236,11 +1508,16 @@ private struct MobileComposer: View {
         .disabled(model.modelSelectionBusy)
     }
 
-    private func permissionButton(_ value: String, _ title: String, icon: String) -> some View {
+    private func permissionButton(_ value: String, _ title: String) -> some View {
         Button {
             Task { await model.choosePermission(value) }
         } label: {
-            Label(title, systemImage: model.selectedSession?.permission == value ? "checkmark" : icon)
+            HStack {
+                PermissionGlyph(value: value, size: 16)
+                Text(title)
+                Spacer()
+                if model.selectedSession?.permission == value { Image(systemName: "checkmark") }
+            }
         }
     }
 
@@ -1249,14 +1526,6 @@ private struct MobileComposer: View {
         case "read-only": "只读"
         case "danger-full-access": "完全访问"
         default: "工作区可写"
-        }
-    }
-
-    private var permissionIcon: String {
-        switch model.selectedSession?.permission {
-        case "read-only": "lock"
-        case "danger-full-access": "lock.open"
-        default: "pencil.and.outline"
         }
     }
 
@@ -1288,9 +1557,9 @@ private struct MobileComposer: View {
     }
 
     private var canSend: Bool {
-        model.selectedSessionID != nil
-            && !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        model.selectedSessionID != nil && (!model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.draftAttachments.isEmpty)
             && !model.sending
+            && (model.subagentStack.last.map { $0.entry.mode == "continuable" && model.subagentParentAvailable[$0.parentID] == true } ?? true)
     }
 
     private var showsControls: Bool {
@@ -1299,6 +1568,41 @@ private struct MobileComposer: View {
 
     private var hasExplicitLineBreak: Bool {
         model.draft.contains("\n")
+    }
+}
+
+private struct MobileAttachmentRail: View {
+    @EnvironmentObject private var model: MobileAppModel
+    let attachments: [MobileDraftAttachment]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 9) {
+                ForEach(attachments) { attachment in
+                    ZStack(alignment: .topTrailing) {
+                        Group {
+                            if attachment.kind == .image, let image = UIImage(data: attachment.data) {
+                                Image(uiImage: image).resizable().scaledToFill()
+                            } else {
+                                VStack(spacing: 4) {
+                                    Image(systemName: "doc.text").font(.title3)
+                                    Text(attachment.name).font(.caption2).lineLimit(1)
+                                    Text(attachment.byteCountText).font(.system(size: 9)).foregroundStyle(.tertiary)
+                                }.padding(6)
+                            }
+                        }
+                        .frame(width: 68, height: 58)
+                        .background(Color.secondary.opacity(0.09))
+                        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                        Button { model.removeAttachment(attachment) } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.white, .black.opacity(0.55))
+                        }
+                        .buttonStyle(.plain).padding(3)
+                    }
+                }
+            }.padding(.horizontal, 2)
+        }.frame(height: 58)
     }
 }
 
@@ -1331,8 +1635,10 @@ private struct MobileMessageView: View {
                     withAnimation(.easeInOut(duration: 0.14)) { expanded.toggle() }
                 } label: {
                     HStack(spacing: 0) {
-                        Image(systemName: expanded ? "chevron.down" : toolIcon)
-                            .font(.system(size: 13, weight: .medium))
+                        Group {
+                            if expanded { Image(systemName: "chevron.down").font(.system(size: 13, weight: .medium)) }
+                            else { toolGlyph }
+                        }
                             .frame(width: 16, height: 16)
                             .foregroundStyle(message.isError ? Color.red : Color.secondary.opacity(0.55))
                             .padding(.trailing, 6)
@@ -1384,8 +1690,10 @@ private struct MobileMessageView: View {
             }
         case .reasoning:
             if compactConversationMode {
-                Label(message.running ? "正在思考" : "已思考", systemImage: "sparkles")
-                    .font(.callout).foregroundStyle(.secondary)
+                HStack(spacing: 7) {
+                    DeepSeekIcon(kind: .think, size: 14)
+                    Text(message.running ? "正在思考" : "已思考")
+                }.font(.callout).foregroundStyle(.secondary)
             } else {
                 DisclosureGroup(isExpanded: $expanded) {
                     Text(message.text)
@@ -1396,7 +1704,7 @@ private struct MobileMessageView: View {
                         .padding(.top, 6)
                 } label: {
                     HStack(spacing: 7) {
-                        Image(systemName: "atom").frame(width: 16)
+                        DeepSeekIcon(kind: .think, size: 14).frame(width: 16)
                         Text("Think").foregroundStyle(.secondary)
                         Text("·").foregroundStyle(.tertiary)
                         Text(reasoningSummary).foregroundStyle(.tertiary).lineLimit(1)
@@ -1405,6 +1713,20 @@ private struct MobileMessageView: View {
                 }
                 .tint(.secondary)
             }
+        case .command:
+            HStack(spacing: 8) {
+                DeepSeekIcon(kind: .terminal, size: 14)
+                    .foregroundStyle(message.isError ? Color.red : Color.secondary)
+                Text(message.text).font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(message.isError ? Color.red : Color.secondary)
+                Text("·").foregroundStyle(.tertiary)
+                Text(message.detail ?? (message.running ? "正在执行" : "已完成"))
+                    .foregroundStyle(message.isError ? Color.red : Color.secondary.opacity(0.7))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .frame(minHeight: 24)
+            .overlay { if message.running { MobileSweepHighlight() } }
         case .notice:
             Label(message.text, systemImage: "exclamationmark.circle")
                 .font(.callout).foregroundStyle(.red)
@@ -1507,6 +1829,24 @@ private struct MobileMessageView: View {
         case "Edit": return "pencil"
         case "Code": return "chevron.left.forwardslash.chevron.right"
         default: return "sparkles"
+        }
+    }
+
+    @ViewBuilder private var toolGlyph: some View {
+        if message.isError {
+            Image(systemName: "xmark.circle").font(.system(size: 13, weight: .medium))
+        } else {
+            let name = (message.toolName ?? "").lowercased()
+            if name == "todo_write" { DeepSeekIcon(kind: .checklist, size: 14) }
+            else if name == "ask_user_question" { DeepSeekIcon(kind: .question, size: 14) }
+            else if name == "skill" { DeepSeekIcon(kind: .skill, size: 14) }
+            else if name.contains("search") || name == "grep" || name == "glob" { DeepSeekIcon(kind: .search, size: 14) }
+            else if name.contains("read") || name.contains("fetch") { DeepSeekIcon(kind: .read, size: 14) }
+            else if name.contains("bash") || name.contains("shell") || name.contains("terminal") || name == "pwsh" { DeepSeekIcon(kind: .terminal, size: 14) }
+            else if name.contains("edit") || name.contains("write") || name.contains("patch") { DeepSeekIcon(kind: .edit, size: 14) }
+            else if name.hasPrefix("cordis_") { DeepSeekIcon(kind: .cordis, size: 14) }
+            else if name.contains("code") { DeepSeekIcon(kind: .code, size: 14) }
+            else { DeepSeekIcon(kind: .sparkle, size: 14) }
         }
     }
 

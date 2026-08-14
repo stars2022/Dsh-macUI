@@ -76,6 +76,9 @@ struct NativeConversationScrollObserver: NSViewRepresentable {
         private weak var scrollView: NSScrollView?
         private var boundsObserver: NSObjectProtocol?
         private var frameObserver: NSObjectProtocol?
+        private var liveScrollStartObserver: NSObjectProtocol?
+        private var liveScrollEndObserver: NSObjectProtocol?
+        private var userScrolling = false
         private var pendingPositionReport = false
         private var pendingIsAtBottom = true
 
@@ -98,7 +101,24 @@ struct NativeConversationScrollObserver: NSViewRepresentable {
                     forName: NSView.boundsDidChangeNotification,
                     object: clip,
                     queue: .main
-                ) { [weak self] _ in self?.reportPosition() }
+                ) { [weak self] _ in
+                    guard self?.userScrolling == true else { return }
+                    self?.reportPosition()
+                }
+
+                self.liveScrollStartObserver = NotificationCenter.default.addObserver(
+                    forName: NSScrollView.willStartLiveScrollNotification,
+                    object: scrollView,
+                    queue: .main
+                ) { [weak self] _ in self?.userScrolling = true }
+                self.liveScrollEndObserver = NotificationCenter.default.addObserver(
+                    forName: NSScrollView.didEndLiveScrollNotification,
+                    object: scrollView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.reportPosition()
+                    self?.userScrolling = false
+                }
 
                 if let document = scrollView.documentView {
                     document.postsFrameChangedNotifications = true
@@ -142,8 +162,13 @@ struct NativeConversationScrollObserver: NSViewRepresentable {
         private func detach() {
             if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
             if let frameObserver { NotificationCenter.default.removeObserver(frameObserver) }
+            if let liveScrollStartObserver { NotificationCenter.default.removeObserver(liveScrollStartObserver) }
+            if let liveScrollEndObserver { NotificationCenter.default.removeObserver(liveScrollEndObserver) }
             boundsObserver = nil
             frameObserver = nil
+            liveScrollStartObserver = nil
+            liveScrollEndObserver = nil
+            userScrolling = false
             scrollView = nil
         }
 

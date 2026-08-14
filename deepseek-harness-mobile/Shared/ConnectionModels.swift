@@ -93,6 +93,107 @@ struct MobileSession: Identifiable, Hashable {
     }
 }
 
+struct MobileSubagentEntry: Identifiable, Hashable {
+    let id: String
+    let mode: String
+    let activity: String
+    let hasChildren: Bool
+    let label: String?
+    let diagnostic: String?
+    let durationMs: Int?
+
+    init?(json: [String: Any]) {
+        guard let id = json["id"] as? String else { return nil }
+        self.id = id
+        if json["kind"] as? String == "diagnostic" {
+            mode = ""
+            activity = "inactive"
+            hasChildren = false
+            label = nil
+            diagnostic = json["reason"] as? String ?? "子代理记录暂不可用"
+            durationMs = nil
+        } else {
+            mode = json["mode"] as? String ?? "one-shot"
+            activity = json["activity"] as? String ?? "inactive"
+            hasChildren = json["hasChildren"] as? Bool ?? false
+            label = json["label"] as? String
+            diagnostic = nil
+            durationMs = (json["durationMs"] as? NSNumber)?.intValue
+        }
+    }
+
+    var isDiagnostic: Bool { diagnostic != nil }
+    var displayName: String { label?.isEmpty == false ? label! : id }
+}
+
+struct MobileSubagentNavigation: Identifiable, Hashable {
+    let parentID: String
+    let entry: MobileSubagentEntry
+    var id: String { entry.id }
+}
+
+struct MobileBackgroundJob: Identifiable, Hashable {
+    let id: String
+    let kind: String
+    let label: String
+    let status: String
+    let detail: String?
+    let startedAt: Date
+    let finishedAt: Date?
+
+    init?(json: [String: Any]) {
+        guard let id = json["id"] as? String,
+              let kind = json["kind"] as? String,
+              let label = json["label"] as? String,
+              let status = json["status"] as? String else { return nil }
+        self.id = id
+        self.kind = kind
+        self.label = label
+        self.status = status
+        detail = json["detail"] as? String
+        let started = (json["startedAt"] as? NSNumber)?.doubleValue ?? 0
+        let finished = (json["finishedAt"] as? NSNumber)?.doubleValue
+        startedAt = Date(timeIntervalSince1970: started / 1_000)
+        finishedAt = finished.map { Date(timeIntervalSince1970: $0 / 1_000) }
+    }
+
+    var isLive: Bool { status == "running" || status == "stopping" }
+}
+
+struct MobileApprovalRequest: Identifiable, Hashable {
+    let rpcID: String
+    let sessionID: String
+    let approvalID: String
+    let toolName: String
+    let callID: String?
+    let reason: String?
+    var id: String { approvalID }
+}
+
+enum MobileDraftAttachmentKind: String, Hashable { case image, textFile }
+
+struct MobileDraftAttachment: Identifiable, Hashable {
+    let id: UUID
+    let kind: MobileDraftAttachmentKind
+    let name: String
+    let mediaType: String
+    let data: Data
+
+    var byteCountText: String { ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file) }
+
+    func promptBlock() -> [String: Any]? {
+        switch kind {
+        case .image:
+            return ["type": "image", "mediaType": mediaType,
+                    "data": data.base64EncodedString(), "name": name]
+        case .textFile:
+            guard let text = String(data: data, encoding: .utf8) else { return nil }
+            let escapedName = name.replacingOccurrences(of: "\"", with: "&quot;")
+            return ["type": "text", "text": "<attached_file name=\"\(escapedName)\" media_type=\"\(mediaType)\">\n\(text)\n</attached_file>"]
+        }
+    }
+}
+
 struct MobileTodoItem: Identifiable, Hashable {
     let content: String
     let status: String
@@ -181,7 +282,30 @@ struct MobileModelSelection: Hashable {
     var key: String { "\(provider)/\(model)" }
 }
 
-enum MobileMessageRole: Equatable { case user, assistant, reasoning, activity, notice }
+enum MobileMessageRole: Equatable { case user, assistant, reasoning, activity, command, notice }
+
+struct MobileQueuedMessage: Identifiable, Hashable {
+    let id: String
+    let messageID: String
+    let placement: String
+    let preview: String
+    let text: String?
+
+    init?(json: [String: Any]) {
+        guard let id = json["id"] as? String,
+              let placement = json["placement"] as? String else { return nil }
+        self.id = id
+        self.placement = placement
+        let message = json["message"] as? [String: Any] ?? [:]
+        messageID = message["id"] as? String ?? id
+        let content = message["content"] as? [[String: Any]] ?? []
+        let textParts = content.compactMap { block in
+            block["type"] as? String == "text" ? block["text"] as? String : nil
+        }
+        text = textParts.count == content.count ? textParts.joined(separator: "\n") : nil
+        preview = text ?? textParts.joined(separator: "\n")
+    }
+}
 
 struct MobileDiffHunk {
     let path: String

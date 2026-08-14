@@ -67,6 +67,7 @@ final class AppModel: ObservableObject {
     @Published var queues: [String: [QueuedMessage]] = [:]
     @Published var jobs: [String: [BackgroundJob]] = [:]
     @Published var draftImages: [DraftImage] = []
+    @Published var draftFiles: [DraftTextFile] = []
     @Published var dockBusy = false
     @Published var permissionSelectionBusy = false
     @Published var planSelectionBusy = false
@@ -667,7 +668,7 @@ final class AppModel: ObservableObject {
         // Host commands are control-plane actions, not user prompts. WebUI
         // intercepts a registered `/name ...` line and sends it through
         // commands.execute so no user bubble or LLM turn is created.
-        if draftImages.isEmpty, let name = Self.slashCommandName(in: text),
+        if draftImages.isEmpty, draftFiles.isEmpty, let name = Self.slashCommandName(in: text),
            commands.contains(where: { $0.name == name }) {
             api.executeCommand(sessionId: current.id, line: text) { [weak self] result in
                 guard let self else { return }
@@ -679,15 +680,19 @@ final class AppModel: ObservableObject {
         if !text.isEmpty { history.append(ConversationItem(id: "local-\(UUID().uuidString)", kind: .user(text: text, images: []), seq: nil, time: Date())) }
         self.current = current.withRunning(true, blank: false, updatedAt: Date())
         let images = draftImages
+        let files = draftFiles
         if let parent = subagentParentId, let childMode = currentSubagentMode, childMode == "continuable" {
-            api.subagentPrompt(parentSessionId: parent, childSessionId: current.id, mode: childMode, text: text, images: images) { [weak self] result in
+            api.subagentPrompt(parentSessionId: parent, childSessionId: current.id, mode: childMode, text: text, images: images, files: files) { [weak self] result in
                 guard let self else { return }
-                if case let .failure(error) = result { self.showPromptError(error) } else { self.draftImages.removeAll { Set(images.map(\.id)).contains($0.id) } }
+                if case let .failure(error) = result { self.showPromptError(error) } else {
+                    self.draftImages.removeAll { Set(images.map(\.id)).contains($0.id) }
+                    self.draftFiles.removeAll { Set(files.map(\.id)).contains($0.id) }
+                }
                 self.scheduleRefresh()
             }
             return
         }
-        api.prompt(sessionId: current.id, text: text, images: images, mode: mode) { [weak self] result in
+        api.prompt(sessionId: current.id, text: text, images: images, files: files, mode: mode) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
@@ -695,6 +700,8 @@ final class AppModel: ObservableObject {
                 // attachments added while the RPC was in flight stay queued.
                 let sent = Set(images.map(\.id))
                 self.draftImages.removeAll { sent.contains($0.id) }
+                let sentFiles = Set(files.map(\.id))
+                self.draftFiles.removeAll { sentFiles.contains($0.id) }
             case let .failure(error):
                 // Keep the rail intact so a failed upload can be retried,
                 // matching the WebUI's transient prompt-error behaviour.
@@ -740,6 +747,28 @@ final class AppModel: ObservableObject {
     }
 
     func removeImage(_ image: DraftImage) { draftImages.removeAll { $0.id == image.id } }
+
+    func addTextFile(url: URL) {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { errorText = "无法读取文件"; return }
+        guard data.count <= 1_024 * 1_024 else { errorText = "文本文件不能超过 1 MB"; return }
+        guard String(data: data, encoding: .utf8) != nil else {
+            errorText = "当前 Host 只支持图片和 UTF-8 文本/代码文件，无法发送这个二进制文件"
+            return
+        }
+        let mediaType: String
+        switch url.pathExtension.lowercased() {
+        case "json": mediaType = "application/json"
+        case "md", "markdown": mediaType = "text/markdown"
+        case "html", "htm": mediaType = "text/html"
+        case "css": mediaType = "text/css"
+        case "csv": mediaType = "text/csv"
+        case "xml": mediaType = "application/xml"
+        default: mediaType = "text/plain"
+        }
+        draftFiles.append(DraftTextFile(id: UUID(), url: url, mediaType: mediaType, data: data))
+    }
+
+    func removeFile(_ file: DraftTextFile) { draftFiles.removeAll { $0.id == file.id } }
 
     func loadImage(_ ref: ImageAttachmentRef, completion: @escaping (Data?) -> Void) {
         guard let sessionId = current?.id else { completion(nil); return }
