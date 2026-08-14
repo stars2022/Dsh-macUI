@@ -30,10 +30,14 @@ final class MobileAppModel: ObservableObject {
     @Published var draftAttachments: [MobileDraftAttachment] = []
     @Published var reconnecting = false
     @Published var interactionBusy = false
+    @Published var stoppingConversation = false
+    @Published private(set) var monitoringPrompt = false
     let profiles = ServerProfileStore()
     private let eventStream = MobileEventStream()
     private var liveRefreshTask: Task<Void, Never>?
     private var relayRefreshTask: Task<Void, Never>?
+    private var promptMonitorTask: Task<Void, Never>?
+    private var optimisticMessages: [MobileMessage] = []
 
     var selectedSession: MobileSession? { sessions.first { $0.id == selectedSessionID } }
     var activeConversationID: String? { subagentStack.last?.entry.id ?? selectedSessionID }
@@ -56,7 +60,7 @@ final class MobileAppModel: ObservableObject {
     }
     var isConversationRunning: Bool {
         if let child = subagentStack.last { return child.entry.activity == "running" }
-        return selectedSession?.running == true
+        return selectedSession?.running == true || monitoringPrompt
     }
     var currentWorkspace: MobileWorkspace? {
         guard let selectedSession else { return workspaces.first }
@@ -82,6 +86,9 @@ final class MobileAppModel: ObservableObject {
     }
 
     func select(_ session: MobileSession) async {
+        promptMonitorTask?.cancel()
+        monitoringPrompt = false
+        optimisticMessages = []
         subagentStack = []
         selectedSessionID = session.id
         await loadHistory(session.id)
@@ -200,12 +207,17 @@ final class MobileAppModel: ObservableObject {
 
     func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (!text.isEmpty || !draftAttachments.isEmpty), let sessionID = selectedSessionID else { return }
+        guard !sending, (!text.isEmpty || !draftAttachments.isEmpty),
+              let sessionID = selectedSessionID else { return }
         let attachments = draftAttachments
         draft = ""
         sending = true
-        if !text.isEmpty { messages.append(MobileMessage(id: "local-\(UUID())", role: .user, text: text, time: Date())) }
-        defer { sending = false }
+        let optimistic: MobileMessage? = text.isEmpty ? nil
+            : MobileMessage(id: "local-\(UUID())", role: .user, text: text, time: Date())
+        if let optimistic {
+            optimisticMessages.append(optimistic)
+            messages.append(optimistic)
+        }
         do {
             var content = attachments.compactMap { $0.promptBlock() }
             if !text.isEmpty { content.append(["type": "text", "text": text]) }
@@ -226,6 +238,11 @@ final class MobileAppModel: ObservableObject {
                            "clientTimeZone": TimeZone.current.identifier]
             }
             _ = try await transport().call(method, payload: payload)
+            // Prompt RPC only acknowledges enqueueing. Re-enable the composer
+            // immediately so a running conversation can accept another queued
+            // message while the current turn keeps streaming.
+            if subagentStack.isEmpty { monitoringPrompt = true }
+            sending = false
             let sentIDs = Set(attachments.map(\.id))
             draftAttachments.removeAll { sentIDs.contains($0.id) }
             if let child = subagentStack.last {
@@ -233,27 +250,46 @@ final class MobileAppModel: ObservableObject {
                 await loadSubagents(parentID: child.parentID)
                 return
             }
-            var observedRunning = false
-            for tick in 0..<1_200 {
-                let history = await loadHistory(activeConversationID ?? sessionID, reportErrors: false, matchingPrompt: text)
-                if history.hasOpenTurn { observedRunning = true }
-                if tick.isMultiple(of: 2), let running = await refreshSessionRunning(sessionID) {
-                    observedRunning = observedRunning || running
-                    if observedRunning && !running && !history.hasOpenTurn { break }
-                }
-                if history.promptCompleted { break }
-                try await Task.sleep(for: .milliseconds(500))
+            promptMonitorTask?.cancel()
+            promptMonitorTask = Task { [weak self] in
+                await self?.monitorPrompt(sessionID: sessionID, matchingPrompt: text)
             }
-            await refresh()
         } catch {
+            sending = false
+            if let optimistic {
+                optimisticMessages.removeAll { $0.id == optimistic.id }
+                messages.removeAll { $0.id == optimistic.id }
+            }
             draft = text
             show(error)
         }
     }
 
+    private func monitorPrompt(sessionID: String, matchingPrompt text: String) async {
+        var observedRunning = false
+        for tick in 0..<1_200 {
+            guard !Task.isCancelled, selectedSessionID == sessionID else { return }
+            let history = await loadHistory(activeConversationID ?? sessionID,
+                                            reportErrors: false, matchingPrompt: text)
+            if history.hasOpenTurn { observedRunning = true }
+            if tick.isMultiple(of: 2), let running = await refreshSessionRunning(sessionID) {
+                observedRunning = observedRunning || running
+                if observedRunning && !running && !history.hasOpenTurn { break }
+            }
+            if history.promptCompleted { break }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        guard !Task.isCancelled else { return }
+        await refresh(reportErrors: false)
+        monitoringPrompt = false
+    }
+
     func reconnect() async {
         eventStream.disconnect()
         relayRefreshTask?.cancel()
+        promptMonitorTask?.cancel()
+        monitoringPrompt = false
+        optimisticMessages = []
         selectedSessionID = nil
         subagentStack = []
         messages = []
@@ -283,6 +319,7 @@ final class MobileAppModel: ObservableObject {
 
     func leaveSubagent() async {
         guard !subagentStack.isEmpty else { return }
+        optimisticMessages = []
         subagentStack.removeLast()
         if let parent = subagentStack.last {
             await loadSubagentHistory(parentID: parent.parentID, entry: parent.entry)
@@ -301,12 +338,17 @@ final class MobileAppModel: ObservableObject {
     }
 
     func stopCurrentConversation() async {
+        guard !stoppingConversation else { return }
+        stoppingConversation = true
+        defer { stoppingConversation = false }
         do {
             if let child = subagentStack.last {
                 try await interruptSubagentThrowing(child.entry, parentID: child.parentID)
                 await loadSubagents(parentID: child.parentID)
             } else if let selectedSessionID {
                 _ = try await transport().call("session.cancel", payload: ["sessionId": selectedSessionID])
+                promptMonitorTask?.cancel()
+                monitoringPrompt = false
                 await refresh(reportErrors: false)
             }
         } catch { show(error) }
@@ -484,7 +526,9 @@ final class MobileAppModel: ObservableObject {
             let projection = await Task.detached(priority: .userInitiated) {
                 (Self.parseMessages(events), Self.historyState(events, matchingPrompt: nil))
             }.value
-            if subagentStack.last?.entry.id == entry.id { messages = projection.0 }
+            if subagentStack.last?.entry.id == entry.id {
+                reconcileOptimisticMessages(with: projection.0)
+            }
             return projection.1
         } catch {
             if reportErrors { show(error) }
@@ -513,12 +557,31 @@ final class MobileAppModel: ObservableObject {
             let projection = await Task.detached(priority: .userInitiated) {
                 (Self.parseMessages(entries), Self.historyState(entries, matchingPrompt: matchingPrompt))
             }.value
-            if selectedSessionID == sessionID { messages = projection.0 }
+            if selectedSessionID == sessionID {
+                reconcileOptimisticMessages(with: projection.0)
+            }
             return projection.1
         } catch {
             if reportErrors { show(error) }
             return .empty
         }
+    }
+
+    /// The authoritative history can briefly lag the enqueue acknowledgement.
+    /// Keep the local user row until its durable counterpart appears so the
+    /// empty Hero and first message do not alternate during polling.
+    private func reconcileOptimisticMessages(with authoritative: [MobileMessage]) {
+        var remaining = optimisticMessages
+        for message in authoritative where message.role == .user {
+            guard let index = remaining.firstIndex(where: { optimistic in
+                guard optimistic.text == message.text else { return false }
+                guard let optimisticTime = optimistic.time, let serverTime = message.time else { return true }
+                return serverTime >= optimisticTime.addingTimeInterval(-2)
+            }) else { continue }
+            remaining.remove(at: index)
+        }
+        optimisticMessages = remaining
+        messages = authoritative + remaining
     }
 
     private func refreshSessionRunning(_ sessionID: String) async -> Bool? {

@@ -35,6 +35,16 @@ macOS、iOS/iPadOS 和 Node.js 服务端三部分；客户端不使用 WebView �
 - Node.js 20 或更高版本；运行当前 DeepSeek Harness 源码建议使用 Node.js 24；
 - 单独获取的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Host。
 
+## 下载构建包
+
+每个 `v*` 标签都会通过 GitHub Actions 构建并发布三个附件：
+
+- `Dsh-macUI-macOS.zip`：临时签名的 macOS Release App；
+- `Dsh-macUI-iOS-unsigned.ipa`：未签名 iOS/iPadOS 包，需要用自己的证书重新签名；
+- `Dsh-macUI-relay-server.tar.gz`：加密同步中继服务端。
+
+分支推送和 Pull Request 也会执行双端 Release 构建及服务端测试，但不会创建 Release。
+
 本仓库不内置官方 Harness 源码。若使用随附启动脚本，请将它克隆到仓库根目录的
 `deepseek-harness-master`：
 

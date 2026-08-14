@@ -761,12 +761,19 @@ private struct MobileConversationView: View {
     @State private var leftBottomDuringGesture = false
     @State private var manualScrollSettling = false
     @State private var manualScrollSettleGeneration = 0
+    @StateObject private var scrollScheduler = MobileScrollScheduler()
 
     var body: some View {
         GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 20) {
+                        if displayRows.isEmpty {
+                            MobileConversationHero()
+                                .frame(maxWidth: .infinity)
+                                .frame(minHeight: max(260, viewport.size.height
+                                    - max(bottomOverlayInset, dockOverlayHeight + 18) - 80))
+                        }
                         ForEach(displayRows) { row in
                             switch row {
                             case let .message(message):
@@ -843,6 +850,7 @@ private struct MobileConversationView: View {
                 }
                 .animation(.snappy(duration: 0.2), value: followsLatest)
                 .onAppear { scheduleScrollToBottom(proxy, animated: false) }
+                .onDisappear { scrollScheduler.cancel() }
                 .onChange(of: streamRevision) { _, _ in
                     if followsLatest { scheduleScrollToBottom(proxy, animated: false) }
                 }
@@ -860,13 +868,17 @@ private struct MobileConversationView: View {
     }
 
     private func scheduleScrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+        scrollScheduler.schedule(after: animated ? .milliseconds(30) : .milliseconds(90)) {
             if animated {
                 withAnimation(.easeOut(duration: 0.18)) {
                     proxy.scrollTo("conversation-bottom", anchor: .bottom)
                 }
             } else {
-                proxy.scrollTo("conversation-bottom", anchor: .bottom)
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo("conversation-bottom", anchor: .bottom)
+                }
             }
         }
     }
@@ -904,6 +916,36 @@ private struct MobileConversationView: View {
             rows.append(.activities(id: "compact-live-thinking", messages: [placeholder], isCurrent: true))
         }
         return rows
+    }
+}
+
+@MainActor
+private final class MobileScrollScheduler: ObservableObject {
+    private var generation = 0
+
+    func schedule(after delay: Duration, action: @escaping @MainActor () -> Void) {
+        generation &+= 1
+        let expected = generation
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, self.generation == expected else { return }
+            action()
+        }
+    }
+
+    func cancel() { generation &+= 1 }
+}
+
+/// Match the desktop blank-session state. A session can already be selected
+/// while its transcript is still empty, so it must not collapse to a blank
+/// canvas just because `selectedSessionID` is non-nil.
+private struct MobileConversationHero: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            DeepSeekIcon(kind: .fish, size: 42).foregroundStyle(.tint)
+            Text("探索未至之境").font(.title2.weight(.semibold))
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -1297,7 +1339,10 @@ private struct MobileComposer: View {
             }
             HStack(spacing: 12) {
                 if !showsControls {
-                    plusMenu
+                    HStack(spacing: 10) {
+                        plusMenu
+                        permissionMenu
+                    }
                     if planModeActive { planModeButton }
                 }
                 composerField
@@ -1312,7 +1357,7 @@ private struct MobileComposer: View {
 
             if showsControls {
                 HStack(spacing: 12) {
-                    HStack(spacing: 18) {
+                    HStack(spacing: 14) {
                         plusMenu
                         permissionMenu
                     }
@@ -1432,26 +1477,27 @@ private struct MobileComposer: View {
 
     private var sendButton: some View {
         Button {
-            focused = false
-            requestScrollToBottom()
             Task {
-                if model.isConversationRunning { await model.stopCurrentConversation() }
-                else { await model.send() }
-                requestScrollToBottom()
+                if shouldStop {
+                    await model.stopCurrentConversation()
+                } else {
+                    focused = false
+                    await model.send()
+                    requestScrollToBottom()
+                }
             }
         } label: {
             Group {
-                if model.sending { ProgressView() }
-                else if model.isConversationRunning {
-                    RoundedRectangle(cornerRadius: 2).fill(Color.white).frame(width: 10, height: 10)
-                }
+                if model.stoppingConversation { ProgressView() }
+                else if shouldStop { DeepSeekIcon(kind: .stop, size: 15) }
+                else if model.sending { ProgressView() }
                 else { DeepSeekIcon(kind: .send, size: 16) }
             }
         }
         .buttonStyle(.borderedProminent)
         .buttonBorderShape(.circle)
-        .disabled(!model.isConversationRunning && !canSend)
-        .accessibilityLabel(model.isConversationRunning ? "中断" : "发送")
+        .disabled(shouldStop ? model.stoppingConversation : !canSend)
+        .accessibilityLabel(shouldStop ? "中断当前任务" : model.isConversationRunning ? "加入队列" : "发送")
     }
 
     private var modelMenu: some View {
@@ -1557,9 +1603,22 @@ private struct MobileComposer: View {
     }
 
     private var canSend: Bool {
-        model.selectedSessionID != nil && (!model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.draftAttachments.isEmpty)
+        model.selectedSessionID != nil && hasSendableContent
             && !model.sending
             && (model.subagentStack.last.map { $0.entry.mode == "continuable" && model.subagentParentAvailable[$0.parentID] == true } ?? true)
+    }
+
+    private var conversationBusy: Bool {
+        model.isConversationRunning || model.sending
+    }
+
+    private var hasSendableContent: Bool {
+        !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !model.draftAttachments.isEmpty
+    }
+
+    private var shouldStop: Bool {
+        conversationBusy && !hasSendableContent
     }
 
     private var showsControls: Bool {
