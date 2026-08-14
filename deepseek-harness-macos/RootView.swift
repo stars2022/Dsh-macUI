@@ -1393,6 +1393,7 @@ private struct MessageRow: View {
         case let .commandInput(text): GoalCommandInputRow(text: text)
         case let .command(name, summary, body, running, error):
             CommandEventRow(name: name, summary: summary, detail: body, running: running, error: error)
+        case let .editedFiles(card): EditedFilesSummaryCardView(card: card).padding(.top, 8)
         case let .producedFiles(paths): ProducedFilesRow(paths: paths)
         case let .notice(text): Label(text, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.red)
         }

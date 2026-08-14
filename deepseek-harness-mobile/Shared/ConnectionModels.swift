@@ -282,7 +282,7 @@ struct MobileModelSelection: Hashable {
     var key: String { "\(provider)/\(model)" }
 }
 
-enum MobileMessageRole: Equatable { case user, assistant, reasoning, activity, command, notice }
+enum MobileMessageRole: Equatable { case user, assistant, reasoning, activity, command, files, notice }
 
 struct MobileQueuedMessage: Identifiable, Hashable {
     let id: String

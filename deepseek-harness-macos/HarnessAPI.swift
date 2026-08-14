@@ -989,17 +989,28 @@ final class HarnessAPI {
                 }
                 if lastAssistantByTurn[turn] == seq, endedTurns.contains(turn) {
                     let successful = Set(tools.compactMap { id, record in record.settled && !record.isError ? id : nil })
-                    var seen = Set<String>()
-                    let paths = (producedByTurn[turn] ?? []).compactMap { produced -> String? in
-                        // A produced path is only committed after its owning
-                        // mutation result; current Host call views do not carry
-                        // callId in locations, so require at least one successful
-                        // settled call in the turn and preserve first-seen order.
-                        guard successful.contains(produced.callId), produced.seq <= seq, seen.insert(produced.path).inserted else { return nil }
-                        return produced.path
+                    var seenDiffCalls = Set<String>()
+                    let editedHunks = (producedByTurn[turn] ?? []).flatMap { produced -> [DiffToolHunk] in
+                        guard successful.contains(produced.callId), produced.seq <= seq,
+                              seenDiffCalls.insert(produced.callId).inserted,
+                              let record = tools[produced.callId] else { return [] }
+                        let presentation = toolPresentation(record: record, state: .ok)
+                            ?? toolPresentation(record: record, state: .running)
+                        guard case let .diff(card)? = presentation else { return [] }
+                        return card.diffs
                     }
-                    if !paths.isEmpty {
-                        items.append(ConversationItem(id: "produced-\(turn)-\(seq)", kind: .producedFiles(paths), seq: seq, time: date,
+                    if !editedHunks.isEmpty {
+                        items.append(ConversationItem(id: "edited-\(turn)-\(seq)",
+                            kind: .editedFiles(DiffToolCard(diffs: editedHunks)), seq: seq, time: date,
+                            stepKey: "\(turn):\(step)"))
+                    }
+                    var seenCreatedPaths = Set<String>()
+                    let createdPaths = editedHunks.compactMap { hunk -> String? in
+                        guard hunk.oldText == nil, seenCreatedPaths.insert(hunk.path).inserted else { return nil }
+                        return hunk.path
+                    }
+                    if !createdPaths.isEmpty {
+                        items.append(ConversationItem(id: "produced-\(turn)-\(seq)", kind: .producedFiles(createdPaths), seq: seq, time: date,
                             stepKey: "\(turn):\(step)"))
                     }
                     // WebUI owns actions at the completed turn tail, not on

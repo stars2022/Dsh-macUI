@@ -180,7 +180,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.deepseek.harness.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = com.stars2022.dsh.mobile;
 				PRODUCT_NAME = "DeepSeek Harness Mobile";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -209,7 +209,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.deepseek.harness.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = com.stars2022.dsh.mobile;
 				PRODUCT_NAME = "DeepSeek Harness Mobile";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;

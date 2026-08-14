@@ -615,6 +615,9 @@ final class MobileAppModel: ObservableObject {
         var commands: [String: (name: String, args: String?, summary: String?, running: Bool, error: Bool)] = [:]
         var children: [String: [String]] = [:]
         var finalizedSteps = Set<String>()
+        var endedTurns = Set<Int>()
+        var lastAssistantSequenceByTurn: [Int: Int] = [:]
+        var toolCallsByTurn: [Int: [String]] = [:]
         for wrapper in entries {
             let event = HarnessTranscriptParsing.event(from: wrapper)
             let data = HarnessTranscriptParsing.data(from: event)
@@ -622,8 +625,11 @@ final class MobileAppModel: ObservableObject {
                let turn = (data["turn"] as? NSNumber)?.intValue,
                let step = (data["step"] as? NSNumber)?.intValue {
                 finalizedSteps.insert("\(turn):\(step)")
+                lastAssistantSequenceByTurn[turn] = (event["seq"] as? NSNumber)?.intValue ?? 0
             }
             switch event["type"] as? String {
+            case "turn/end":
+                if let turn = (data["turn"] as? NSNumber)?.intValue { endedTurns.insert(turn) }
             case "command/run":
                 guard let id = data["commandId"] as? String else { break }
                 commands[id] = (data["name"] as? String ?? "command", data["args"] as? String,
@@ -635,6 +641,10 @@ final class MobileAppModel: ObservableObject {
                                 false, data["kind"] as? String == "error")
             case "tool/call":
                 guard let id = data["callId"] as? String else { break }
+                if let turn = (data["turn"] as? NSNumber)?.intValue,
+                   !(toolCallsByTurn[turn] ?? []).contains(id) {
+                    toolCallsByTurn[turn, default: []].append(id)
+                }
                 let view = (wrapper["view"] as? [String: Any])?["view"] as? [String: Any]
                 var record = tools[id] ?? ToolRecord(name: "", arguments: "")
                 record.name = data["name"] as? String ?? record.name
@@ -705,6 +715,7 @@ final class MobileAppModel: ObservableObject {
                 let text = HarnessTranscriptParsing.text(from: content)
                 if !text.isEmpty { result.append(MobileMessage(id: "user-\(seq)", role: .user, text: text, time: time)) }
             case "assistant/message":
+                let turn = (data["turn"] as? NSNumber)?.intValue ?? 0
                 for (index, block) in content.enumerated() {
                     switch block["type"] as? String {
                     case "reasoning":
@@ -725,6 +736,16 @@ final class MobileAppModel: ObservableObject {
                         result.append(Self.makeToolMessage(id: id, name: toolName, arguments: arguments,
                             time: time, tools: tools, children: children))
                     default: break
+                    }
+                }
+                if endedTurns.contains(turn), lastAssistantSequenceByTurn[turn] == seq {
+                    let diffs = (toolCallsByTurn[turn] ?? []).flatMap { id -> [MobileDiffHunk] in
+                        guard let record = tools[id], record.settled, !record.isError else { return [] }
+                        return record.diffs
+                    }
+                    if !diffs.isEmpty {
+                        result.append(MobileMessage(id: "files-\(turn)-\(seq)", role: .files,
+                            text: "", time: time, toolDiffs: diffs))
                     }
                 }
             case "assistant/chunk":

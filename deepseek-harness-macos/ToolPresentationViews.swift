@@ -385,6 +385,181 @@ private struct DiffRow: Identifiable {
     let text: String
 }
 
+private struct DiffFileSummary: Identifiable {
+    let path: String
+    var additions: Int
+    var deletions: Int
+    var id: String { path }
+}
+
+struct EditedFilesSummaryCardView: View {
+    @EnvironmentObject private var model: AppModel
+    let card: DiffToolCard
+    @State private var showingAllFiles = false
+    @State private var reviewing = false
+    @State private var expandedReview = false
+    @State private var copied = false
+    private let maxLines = 8
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "doc.badge.plus")
+                    .font(.system(size: 20, weight: .medium)).foregroundStyle(.secondary)
+                    .frame(width: 40, height: 40)
+                    .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("已编辑 \(card.fileCount) 个文件").font(.system(size: 15, weight: .semibold))
+                    HStack(spacing: 5) {
+                        Text("+\(card.additions)").foregroundStyle(Color(nsColor: Theme.stateSuccess))
+                        Text("-\(card.deletions)").foregroundStyle(Color(nsColor: Theme.stateError))
+                    }.font(.system(size: 13)).monospacedDigit()
+                }
+                Spacer(minLength: 12)
+                Button(reviewing ? "收起审核" : "审核") {
+                    withAnimation(.easeInOut(duration: 0.16)) { reviewing.toggle() }
+                }
+                .buttonStyle(.bordered).controlSize(.small)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 12)
+
+            Divider().opacity(0.65)
+
+            VStack(spacing: 0) {
+                ForEach(visibleFiles) { fileRow($0) }
+                if fileSummaries.count > fileLimit {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) { showingAllFiles.toggle() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(showingAllFiles ? "收起" : "再显示 \(fileSummaries.count - fileLimit) 个文件")
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                                .rotationEffect(.degrees(showingAllFiles ? 180 : 0))
+                            Spacer()
+                        }
+                        .font(.system(size: 13, weight: .medium)).foregroundStyle(.primary)
+                        .frame(height: 34).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).padding(.horizontal, 14)
+                }
+            }
+
+            if reviewing {
+                Divider().opacity(0.65)
+                ZStack(alignment: .topTrailing) {
+                    ScrollView(.horizontal) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(headRows) { rowView($0) }
+                            if hiddenCount > 0 {
+                                Button(expandedReview ? "收起" : "… 其余 \(hiddenCount) 行") {
+                                    expandedReview.toggle()
+                                }
+                                .buttonStyle(.plain).foregroundStyle(.tertiary).frame(height: 22)
+                            }
+                            if !expandedReview { ForEach(tailRows) { rowView($0) } }
+                        }
+                        .padding(.horizontal, 14).padding(.vertical, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Button(copied ? "复制成功" : "复制") { copy() }
+                        .buttonStyle(.plain).foregroundStyle(.secondary).font(.system(size: 13))
+                        .padding(.top, 8).padding(.trailing, 12)
+                }
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.62),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .stroke(Color.primary.opacity(0.11), lineWidth: 1))
+    }
+
+    private let fileLimit = 3
+    private var visibleFiles: [DiffFileSummary] {
+        showingAllFiles ? fileSummaries : Array(fileSummaries.prefix(fileLimit))
+    }
+    private var fileSummaries: [DiffFileSummary] {
+        var order: [String] = []
+        var values: [String: DiffFileSummary] = [:]
+        for diff in card.diffs {
+            if values[diff.path] == nil { order.append(diff.path) }
+            var summary = values[diff.path] ?? DiffFileSummary(path: diff.path, additions: 0, deletions: 0)
+            summary.additions += contentLines(diff.newText).count
+            summary.deletions += diff.oldText.map { contentLines($0).count } ?? 0
+            values[diff.path] = summary
+        }
+        return order.compactMap { values[$0] }
+    }
+
+    private func fileRow(_ file: DiffFileSummary) -> some View {
+        HStack(spacing: 10) {
+            pathText(file.path).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 8)
+            HStack(spacing: 4) {
+                Text("+\(file.additions)").foregroundStyle(Color(nsColor: Theme.stateSuccess))
+                Text("-\(file.deletions)").foregroundStyle(Color(nsColor: Theme.stateError))
+            }.monospacedDigit()
+        }
+        .font(.system(size: 13)).padding(.horizontal, 14).frame(height: 34)
+        .help(file.path)
+    }
+
+    private func pathText(_ path: String) -> Text {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        let directory = String(path.dropLast(name.count))
+        return Text(directory).foregroundColor(.secondary) + Text(name).foregroundColor(.primary)
+    }
+
+    private var rows: [DiffRow] {
+        var result: [DiffRow] = []; var previous: String?; var index = 0
+        func append(_ kind: DiffRow.Kind, _ text: String) { result.append(DiffRow(id: index, kind: kind, text: text)); index += 1 }
+        for diff in card.diffs {
+            append(diff.path == previous ? .gap : .path, diff.path == previous ? "⋯" : diff.path); previous = diff.path
+            if let old = diff.oldText { contentLines(old).forEach { append(.deleted, $0) } }
+            contentLines(diff.newText).forEach { append(.added, $0) }
+        }
+        return result
+    }
+    private var hiddenCount: Int { max(0, rows.count - maxLines) }
+    private var headRows: [DiffRow] { expandedReview || hiddenCount == 0 ? rows : Array(rows.prefix((maxLines + 1) / 2)) }
+    private var tailRows: [DiffRow] { hiddenCount == 0 ? [] : Array(rows.suffix(maxLines - (maxLines + 1) / 2)) }
+    private var copyText: String { rows.map { row in row.kind == .added ? "+ \(row.text)" : row.kind == .deleted ? "- \(row.text)" : row.text }.joined(separator: "\n") }
+    private func contentLines(_ text: String) -> [String] { text.isEmpty ? [] : String(text.dropLast(text.hasSuffix("\n") ? 1 : 0)).split(separator: "\n", omittingEmptySubsequences: false).map(String.init) }
+    private func rowView(_ row: DiffRow) -> some View {
+        HStack(spacing: 0) {
+            Text(prefix(row))
+                .frame(width: row.kind == .added || row.kind == .deleted ? 22 : 0, alignment: .center)
+            Text(row.text).fontWeight(row.kind == .path ? .semibold : .regular)
+                .padding(.trailing, row.kind == .path ? 56 : 14)
+        }
+        .font(toolCodeFont)
+        .foregroundStyle(color(row))
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(minHeight: 22)
+        .background(rowBackground(row))
+        .textSelection(.enabled)
+    }
+    private func prefix(_ row: DiffRow) -> String { row.kind == .added ? "+ " : row.kind == .deleted ? "- " : "" }
+    private func color(_ row: DiffRow) -> Color {
+        row.kind == .added ? Color(nsColor: Theme.stateSuccess)
+            : row.kind == .deleted ? Color(nsColor: Theme.stateError)
+            : row.kind == .gap ? Color.secondary : Color.primary
+    }
+    private func rowBackground(_ row: DiffRow) -> Color {
+        if row.kind == .added { return Color(nsColor: Theme.stateSuccess).opacity(0.10) }
+        if row.kind == .deleted { return Color(nsColor: Theme.stateError).opacity(0.10) }
+        return .clear
+    }
+    private func copy() {
+        guard !copied else { return }
+        model.copy(copyText); copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { copied = false }
+    }
+}
+
+/// The expanded tool body remains the full red/green patch. The Codex-style
+/// per-turn summary is a separate transcript row and never replaces this.
 private struct DiffToolCardView: View {
     @EnvironmentObject private var model: AppModel
     let card: DiffToolCard
@@ -408,7 +583,9 @@ private struct DiffToolCardView: View {
                         .padding(.horizontal, 14).padding(.vertical, 12)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Button(copied ? "复制成功" : "复制") { copy() }.buttonStyle(.plain).foregroundStyle(.secondary).font(.system(size: 13)).padding(.top, 8).padding(.trailing, 12)
+                    Button(copied ? "复制成功" : "复制") { copy() }
+                        .buttonStyle(.plain).foregroundStyle(.secondary).font(.system(size: 13))
+                        .padding(.top, 8).padding(.trailing, 12)
                 }
                 Text("└ +\(card.additions) -\(card.deletions) · \(card.fileCount) file\(card.fileCount == 1 ? "" : "s")")
                     .font(toolCodeFont).foregroundStyle(.tertiary).padding(.horizontal, 14).padding(.bottom, 12)
@@ -418,9 +595,12 @@ private struct DiffToolCardView: View {
 
     private var rows: [DiffRow] {
         var result: [DiffRow] = []; var previous: String?; var index = 0
-        func append(_ kind: DiffRow.Kind, _ text: String) { result.append(DiffRow(id: index, kind: kind, text: text)); index += 1 }
+        func append(_ kind: DiffRow.Kind, _ text: String) {
+            result.append(DiffRow(id: index, kind: kind, text: text)); index += 1
+        }
         for diff in card.diffs {
-            append(diff.path == previous ? .gap : .path, diff.path == previous ? "⋯" : diff.path); previous = diff.path
+            append(diff.path == previous ? .gap : .path, diff.path == previous ? "⋯" : diff.path)
+            previous = diff.path
             if let old = diff.oldText { contentLines(old).forEach { append(.deleted, $0) } }
             contentLines(diff.newText).forEach { append(.added, $0) }
         }
@@ -433,17 +613,12 @@ private struct DiffToolCardView: View {
     private func contentLines(_ text: String) -> [String] { text.isEmpty ? [] : String(text.dropLast(text.hasSuffix("\n") ? 1 : 0)).split(separator: "\n", omittingEmptySubsequences: false).map(String.init) }
     private func rowView(_ row: DiffRow) -> some View {
         HStack(spacing: 0) {
-            Text(prefix(row))
-                .frame(width: row.kind == .added || row.kind == .deleted ? 22 : 0, alignment: .center)
+            Text(prefix(row)).frame(width: row.kind == .added || row.kind == .deleted ? 22 : 0, alignment: .center)
             Text(row.text).fontWeight(row.kind == .path ? .semibold : .regular)
                 .padding(.trailing, row.kind == .path ? 56 : 14)
         }
-        .font(toolCodeFont)
-        .foregroundStyle(color(row))
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(minHeight: 22)
-        .background(rowBackground(row))
-        .textSelection(.enabled)
+        .font(toolCodeFont).foregroundStyle(color(row)).fixedSize(horizontal: true, vertical: false)
+        .frame(minHeight: 22).background(rowBackground(row)).textSelection(.enabled)
     }
     private func prefix(_ row: DiffRow) -> String { row.kind == .added ? "+ " : row.kind == .deleted ? "- " : "" }
     private func color(_ row: DiffRow) -> Color {

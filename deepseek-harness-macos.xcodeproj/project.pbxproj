@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		000000000000000000000120 /* deepseek-harness-macos.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = "deepseek-harness-macos.app"; path = "DeepSeek Harness.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000120 /* DeepSeek Harness.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "DeepSeek Harness.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -44,7 +44,7 @@
 		000000000000000000000020 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000120 /* deepseek-harness-macos.app */,
+				000000000000000000000120 /* DeepSeek Harness.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -68,7 +68,7 @@
 			);
 			name = "deepseek-harness-macos";
 			productName = MyApp;
-			productReference = 000000000000000000000120 /* deepseek-harness-macos.app */;
+			productReference = 000000000000000000000120 /* DeepSeek Harness.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -203,7 +203,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.deepseek.harness;
+				PRODUCT_BUNDLE_IDENTIFIER = com.stars2022.dsh;
 				PRODUCT_NAME = "DeepSeek Harness";
 				SUPPORTED_PLATFORMS = macosx;
 			};
@@ -235,7 +235,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.deepseek.harness;
+				PRODUCT_BUNDLE_IDENTIFIER = com.stars2022.dsh;
 				PRODUCT_NAME = "DeepSeek Harness";
 				SUPPORTED_PLATFORMS = macosx;
 			};

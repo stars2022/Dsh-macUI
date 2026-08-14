@@ -1727,6 +1727,8 @@ private struct MobileMessageView: View {
             }
             .frame(minHeight: 24)
             .overlay { if message.running { MobileSweepHighlight() } }
+        case .files:
+            MobileEditedFileCapsules(diffs: message.toolDiffs)
         case .notice:
             Label(message.text, systemImage: "exclamationmark.circle")
                 .font(.callout).foregroundStyle(.red)
@@ -1877,6 +1879,36 @@ private struct MobileMessageView: View {
             options: .init(interpretedSyntax: .full))) ?? AttributedString(tail)
         return output
     }
+}
+
+private struct MobileEditedFileCapsules: View {
+    let diffs: [MobileDiffHunk]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(isOnlyNewFiles ? "生成的文件" : "修改的文件")
+                .font(.caption).foregroundStyle(.tertiary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(paths, id: \.self) { path in
+                        Text(URL(fileURLWithPath: path).lastPathComponent)
+                            .font(.callout).lineLimit(1)
+                            .padding(.horizontal, 10).frame(height: 28)
+                            .background(Color.secondary.opacity(0.10),
+                                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .accessibilityLabel(path)
+                    }
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private var paths: [String] {
+        var seen = Set<String>()
+        return diffs.map(\.path).filter { seen.insert($0).inserted }
+    }
+    private var isOnlyNewFiles: Bool { diffs.allSatisfy { $0.oldText == nil } }
 }
 
 private struct MobileMarkdownView: View {

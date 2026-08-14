@@ -557,6 +557,7 @@ enum ConversationKind: Hashable {
     case tool(ToolCall)
     case commandInput(String)
     case command(name: String, summary: String, body: String?, running: Bool, error: Bool)
+    case editedFiles(DiffToolCard)
     case producedFiles([String])
     case notice(String)
 }
