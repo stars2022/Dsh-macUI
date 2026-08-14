@@ -1,5 +1,7 @@
 # Dsh-macUI
 
+[English](README_EN.md) | 简体中文
+
 DeepSeek Harness 的原生 Apple 客户端与加密同步中继。仓库采用单仓库结构，包含
 macOS、iOS/iPadOS 和 Node.js 服务端三部分；客户端不使用 WebView 来承载主界面。
 
